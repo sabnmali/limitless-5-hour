@@ -202,15 +202,27 @@ jobs:
           # Provider code runs inside a disposable container. It can access its
           # own auth file, but never the later secret-update token or any Claude
           # credential. --rm also prevents a package from leaving a host daemon.
+          # Host networking avoids response-stream failures behind the nested
+          # Docker bridge on GitHub's ephemeral Linux runners.
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --network host \
+            -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e ALL_PROXY \
+            -e http_proxy -e https_proxy -e no_proxy -e all_proxy \
+            -e SSL_CERT_FILE=/runner-ca/ca-certificates.crt \
+            -e CURL_CA_BUNDLE=/runner-ca/ca-certificates.crt \
+            -e NODE_EXTRA_CA_CERTS=/runner-ca/ca-certificates.crt \
             -e HOME=/codex-home -e CODEX_HOME=/codex-home \
+            -e npm_config_prefix=/codex-home/npm \
+            -e PATH=/codex-home/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             -v "$codex_home:/codex-home" \
             -v "$codex_state:/repo/state" \
             -v "$codex_logs:/repo/logs" \
             -v "$provider_config:/config/cloud.env:ro" \
+            -v "/etc/ssl/certs/ca-certificates.crt:/runner-ca/ca-certificates.crt:ro" \
             node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 \
-            bash -lc 'npm install -g @openai/codex@0.155.0 >/dev/null && L5H_STATE_FILE=/repo/state/cloud-state.env bash /repo/bin/keepalive.sh --config /config/cloud.env'
+            bash -c 'npm install -g @openai/codex@0.155.0 >/dev/null && L5H_STATE_FILE=/repo/state/cloud-state.env bash /repo/bin/keepalive.sh --config /config/cloud.env'
           sudo chown -R "$(id -u):$(id -g)" "$codex_home" "$codex_state" "$codex_logs"
           last="$(awk -F= '$1=="CODEX_LAST" && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env")"
           [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt "$old" ] || {

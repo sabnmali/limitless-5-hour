@@ -307,7 +307,11 @@ ping_claude() {
     # Matching on text alone is not enough: an unrecognised failure would be
     # recorded as a successful ping and stall the schedule for five hours.
     if [ "$rc" -ne 0 ]; then
-        PING_MESSAGE="claude exited $rc (CLI output withheld)"
+        if [ "$rc" -eq 124 ]; then
+            PING_MESSAGE='claude timed out after 120 seconds (CLI output withheld)'
+        else
+            PING_MESSAGE="claude exited $rc (CLI output withheld)"
+        fi
         return 1
     fi
 
@@ -343,7 +347,7 @@ ping_claude() {
 
 ping_codex() {
     PING_MESSAGE=''
-    local exe
+    local exe failure_class failure_detail
     if ! exe="$(resolve_cli codex)"; then
         PING_MESSAGE='codex CLI not found (set CODEX_BIN in config.env, or npm i -g @openai/codex)'
         return 1
@@ -359,11 +363,58 @@ ping_codex() {
         return 0
     fi
 
-    local out rc
+    local out rc event_types
     out="$(run_bounded_cli "$exe" "${args[@]}" 2>&1)"; rc=$?
 
+    # Event names are a small, non-secret part of JSONL output. They make a
+    # failed cloud run diagnosable without publishing prompts, responses,
+    # account data or raw CLI errors.
+    event_types="$(printf '%s' "$out" |
+        grep -oE '"type"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' |
+        sed -E 's/.*"([A-Za-z0-9._-]+)"/\1/' | sort -u | head -10 |
+        tr '\n' ',' | sed 's/,$//' || true)"
+
+    failure_class=provider_error
+    failure_detail=none
+    if printf '%s' "$out" | grep -qiE 'usage[_ -]?limit|quota'; then
+        failure_class=usage_limit
+    elif printf '%s' "$out" | grep -qiE '(^|[^0-9])401([^0-9]|$)|unauthori[sz]ed|not logged in|authentication'; then
+        failure_class=authentication
+    elif printf '%s' "$out" | grep -qiE '(^|[^0-9])429([^0-9]|$)|rate[_ -]?limit'; then
+        failure_class=rate_limit
+    elif printf '%s' "$out" | grep -qiE 'model[_ -]?(not[_ -]?found|unsupported)|unknown model'; then
+        failure_class=model
+    elif printf '%s' "$out" | grep -qiE 'network|connection|connect error|dns|certificate|tls'; then
+        failure_class=network
+    elif printf '%s' "$out" | grep -qiE 'sandbox|landlock|seccomp|permission denied'; then
+        failure_class=sandbox
+    fi
+
+    # Publish only a fixed category, never the provider's raw error text.
+    if printf '%s' "$out" | grep -qiE 'name resolution|resolve host|dns'; then
+        failure_detail=dns
+    elif printf '%s' "$out" | grep -qiE 'certificate|tls|ssl'; then
+        failure_detail=tls
+    elif printf '%s' "$out" | grep -qiE 'proxy'; then
+        failure_detail=proxy
+    elif printf '%s' "$out" | grep -qiE 'websocket|web socket'; then
+        failure_detail=websocket
+    elif printf '%s' "$out" | grep -qiE 'http[/ -]?2|h2 protocol'; then
+        failure_detail=http2
+    elif printf '%s' "$out" | grep -qiE 'stream disconnected|connection closed|connection reset'; then
+        failure_detail=stream_disconnect
+    elif printf '%s' "$out" | grep -qiE 'timed out|timeout'; then
+        failure_detail=connect_timeout
+    elif printf '%s' "$out" | grep -qiE 'error sending request|connect error|connection'; then
+        failure_detail=request
+    fi
+
     if [ "$rc" -ne 0 ]; then
-        PING_MESSAGE="codex exited $rc (CLI output withheld)"
+        if [ "$rc" -eq 124 ]; then
+            PING_MESSAGE="codex timed out after 120 seconds (class=$failure_class detail=$failure_detail event types=${event_types:-none}; CLI output withheld)"
+        else
+            PING_MESSAGE="codex exited $rc (class=$failure_class detail=$failure_detail event types=${event_types:-none}; CLI output withheld)"
+        fi
         return 1
     fi
 
@@ -382,7 +433,7 @@ ping_codex() {
 
     if printf '%s' "$out" | grep -qE '"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"' ||
        ! printf '%s' "$out" | grep -qE '"type"[[:space:]]*:[[:space:]]*"turn.completed"'; then
-        PING_MESSAGE='codex returned no successful completed turn (CLI output withheld)'
+        PING_MESSAGE="codex returned no successful completed turn (class=$failure_class detail=$failure_detail event types=${event_types:-none}; CLI output withheld)"
         return 1
     fi
     PING_MESSAGE='codex ok'

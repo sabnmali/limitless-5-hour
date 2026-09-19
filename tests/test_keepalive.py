@@ -45,6 +45,7 @@ Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"in
             self.mock.write_text('''#!/usr/bin/env bash
 echo call >> "$FAKE_COUNT"
 [ "$FAKE_MODE" != slow ] || sleep 2
+[ "$FAKE_MODE" != trapzero ] || { trap 'exit 0' TERM; sleep 20; }
 case "$FAKE_MODE" in
 exit) echo secret-test-123; exit 7 ;;
 invalid) echo '{}' ;;
@@ -179,6 +180,14 @@ esac
 @unittest.skipUnless(BASH, 'Bash unavailable')
 class BashTests(KeepaliveTests, unittest.TestCase):
     platform = 'bash'
+
+    def test_timeout_cannot_be_reported_as_success(self):
+        self.env['FAKE_MODE'] = 'trapzero'
+        helper = self.root / 'bin/run-cli.sh'
+        helper.write_text(helper.read_text().replace('sleep 120', 'sleep 2'), newline='\n')
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('timed out', result.stdout + result.stderr)
 
     def test_due_has_no_side_effects(self):
         self.assertEqual(self.run_cli('--due').returncode, 0)
