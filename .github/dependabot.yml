@@ -1,0 +1,11 @@
+# Keeps the pinned action SHAs from going stale: Dependabot opens a pull
+# request when a pinned action publishes a new release, with the changelog
+# attached so the bump can be reviewed rather than trusted blindly.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: build

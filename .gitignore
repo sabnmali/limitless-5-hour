@@ -1,0 +1,26 @@
+# Local configuration (your own model / prompt / interval choices)
+config.env
+.ai-sync-backups/
+__pycache__/
+*.pyc
+auth.json
+.env
+.netlify/
+*.pem
+*.key
+
+# Runtime output - keep the folders, ignore their contents
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
+# The cloud state IS tracked - it is how the GitHub Actions run remembers
+# when it last pinged, and committing it also keeps the schedule alive.
+!state/cloud-state.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

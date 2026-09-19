@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    paths-ignore:
+      - 'state/cloud-state.env'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Offline regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Dispatcher regression tests
+        run: node --test tests/test_dispatch.mjs

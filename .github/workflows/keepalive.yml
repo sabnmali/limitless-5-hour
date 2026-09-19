@@ -1,0 +1,334 @@
+name: keepalive
+
+# The public repository is source code only. Deploy this workflow from a
+# private repository created from the template; subscription credentials must
+# never be stored in a public/open-source repository.
+on:
+  schedule:
+    # The script owns the 301-minute interval. These wake-ups only ask whether
+    # either provider is due; most runs finish in a few seconds without a model
+    # call. Netlify may dispatch the same due check as an independent fallback.
+    - cron: '7,37 * * * *'
+    # A daily health check still runs when Netlify is selected as primary.
+    - cron: '13 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Legacy compatibility only; ignored and never bypasses the due check'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: no-5-hour-limit
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >-
+      github.event.repository.private == true &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (vars.L5H_NETLIFY_PRIMARY != 'true' || github.event_name != 'schedule' ||
+       github.event.schedule == '13 3 * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      claude_due: ${{ steps.due.outputs.claude_due }}
+      codex_due: ${{ steps.due.outputs.codex_due }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare private deployment configuration
+        env:
+          L5H_CLAUDE_ENABLED: ${{ vars.L5H_CLAUDE_ENABLED }}
+          L5H_CODEX_ENABLED: ${{ vars.L5H_CODEX_ENABLED }}
+        run: |
+          set -euo pipefail
+          effective="$RUNNER_TEMP/l5h-cloud.env"
+          cp cloud.env "$effective"
+
+          set_switch() {
+            local key="$1" value
+            value="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+            case "$value" in
+              '') ;;
+              true|1|yes|on)  sed -i "s/^${key}=.*/${key}=true/"  "$effective" ;;
+              false|0|no|off) sed -i "s/^${key}=.*/${key}=false/" "$effective" ;;
+              *) echo "::error::$key repository variable must be true or false."; exit 1 ;;
+            esac
+          }
+
+          # Repository variables are private-deployment switches and are not
+          # inherited from the public template.
+          set_switch CLAUDE_ENABLED "${L5H_CLAUDE_ENABLED:-}"
+          set_switch CODEX_ENABLED  "${L5H_CODEX_ENABLED:-}"
+
+      - name: Decide which providers are due
+        id: due
+        run: |
+          set -uo pipefail
+          effective="$RUNNER_TEMP/l5h-cloud.env"
+          enabled="$(bash bin/keepalive.sh --config "$effective" --enabled)" || {
+            echo '::error::Could not read the cloud configuration'; exit 1; }
+          echo "Enabled providers: ${enabled:-none}"
+
+          set +e
+          due="$(L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$effective" --due)"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "Due: $due" ;;
+            3) echo "$due" ;;
+            *) echo "::error::keepalive.sh --due failed with exit $rc: $due"; exit 1 ;;
+          esac
+
+          due_words="$(printf '%s' "$due" | tr '\n\t' '  ')"
+          case " $due_words " in *' claude '*) echo 'claude_due=true' >> "$GITHUB_OUTPUT" ;; *) echo 'claude_due=false' >> "$GITHUB_OUTPUT" ;; esac
+          case " $due_words " in *' codex '*)  echo 'codex_due=true'  >> "$GITHUB_OUTPUT" ;; *) echo 'codex_due=false'  >> "$GITHUB_OUTPUT" ;; esac
+
+  claude:
+    needs: plan
+    if: needs.plan.outputs.claude_due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    permissions:
+      contents: read
+    outputs:
+      last: ${{ steps.ping.outputs.last }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install pinned Claude CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.276
+
+      - name: Prepare isolated Claude configuration
+        run: |
+          set -euo pipefail
+          provider_config="$RUNNER_TEMP/claude.env"
+          cp cloud.env "$provider_config"
+          sed -i 's/^CLAUDE_ENABLED=.*/CLAUDE_ENABLED=true/'  "$provider_config"
+          sed -i 's/^CODEX_ENABLED=.*/CODEX_ENABLED=false/'   "$provider_config"
+
+      - name: Ping Claude
+        id: ping
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo '::error::CLAUDE_CODE_OAUTH_TOKEN is missing.'
+            exit 1
+          fi
+          provider_config="$RUNNER_TEMP/claude.env"
+          old="$(awk -F= '$1=="CLAUDE_LAST" && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env)"
+          [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config"
+          last="$(awk -F= '$1=="CLAUDE_LAST" && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env)"
+          [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt "$old" ] || {
+            echo '::error::Claude success timestamp did not advance.'; exit 1; }
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Claude keepalive'
+            echo ''
+            echo '```'
+            L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config" --status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  codex:
+    needs: plan
+    if: needs.plan.outputs.codex_due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    permissions:
+      contents: read
+    outputs:
+      last: ${{ steps.ping.outputs.last }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare isolated Codex configuration and credentials
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+            echo '::error::CODEX_AUTH_JSON is missing.'
+            exit 1
+          fi
+          provider_config="$RUNNER_TEMP/codex.env"
+          codex_home="$RUNNER_TEMP/codex-home"
+          codex_state="$RUNNER_TEMP/codex-state"
+          codex_logs="$RUNNER_TEMP/codex-logs"
+          cp cloud.env "$provider_config"
+          sed -i 's/^CLAUDE_ENABLED=.*/CLAUDE_ENABLED=false/' "$provider_config"
+          sed -i 's/^CODEX_ENABLED=.*/CODEX_ENABLED=true/'     "$provider_config"
+          mkdir -p "$codex_home" "$codex_state" "$codex_logs"
+          chmod 700 "$codex_home"
+          cp state/cloud-state.env "$codex_state/cloud-state.env"
+          printf '%s' "$CODEX_AUTH_JSON" > "$codex_home/auth.json"
+          chmod 600 "$codex_home/auth.json"
+
+      - name: Ping Codex
+        id: ping
+        run: |
+          set -euo pipefail
+          provider_config="$RUNNER_TEMP/codex.env"
+          codex_home="$RUNNER_TEMP/codex-home"
+          codex_state="$RUNNER_TEMP/codex-state"
+          codex_logs="$RUNNER_TEMP/codex-logs"
+          old="$(awk -F= '$1=="CODEX_LAST" && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env")"
+          [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          # Provider code runs inside a disposable container. It can access its
+          # own auth file, but never the later secret-update token or any Claude
+          # credential. --rm also prevents a package from leaving a host daemon.
+          docker run --rm \
+            -e HOME=/codex-home -e CODEX_HOME=/codex-home \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$codex_home:/codex-home" \
+            -v "$codex_state:/repo/state" \
+            -v "$codex_logs:/repo/logs" \
+            -v "$provider_config:/config/cloud.env:ro" \
+            node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 \
+            bash -lc 'npm install -g @openai/codex@0.155.0 >/dev/null && L5H_STATE_FILE=/repo/state/cloud-state.env bash /repo/bin/keepalive.sh --config /config/cloud.env'
+          sudo chown -R "$(id -u):$(id -g)" "$codex_home" "$codex_state" "$codex_logs"
+          last="$(awk -F= '$1=="CODEX_LAST" && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env")"
+          [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt "$old" ] || {
+            echo '::error::Codex success timestamp did not advance.'; exit 1; }
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Codex keepalive'
+            echo ''
+            echo '```'
+            L5H_STATE_FILE="$codex_state/cloud-state.env" bash bin/keepalive.sh --config "$provider_config" --status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore Codex file ownership
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/codex-state" "$RUNNER_TEMP/codex-logs" 2>/dev/null || true
+
+      - name: Persist refreshed Codex credentials
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_SECRET_UPDATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="$RUNNER_TEMP/codex-home/auth.json"
+          if [ ! -s "$auth" ]; then
+            echo '::error::Codex credential file is missing after the run.'
+            exit 1
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo '::error::CODEX_SECRET_UPDATE_TOKEN is missing.'
+            exit 1
+          fi
+          if ! gh secret set CODEX_AUTH_JSON --repo "$GITHUB_REPOSITORY" < "$auth" >/dev/null 2>&1; then
+            echo '::error::Could not save refreshed Codex credentials.'
+            exit 1
+          fi
+          echo 'Codex credentials saved securely.'
+
+      - name: Remove temporary Codex credentials
+        if: always()
+        run: sudo rm -rf -- "$RUNNER_TEMP/codex-home"
+
+  save:
+    needs: [plan, claude, codex]
+    if: >-
+      ${{ always() && needs.plan.result == 'success' &&
+          (needs.claude.outputs.last != '' || needs.codex.outputs.last != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Save the new state
+        env:
+          CLAUDE_NEW: ${{ needs.claude.outputs.last }}
+          CODEX_NEW: ${{ needs.codex.outputs.last }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current() {
+            awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env 2>/dev/null | tail -n1
+          }
+          choose() {
+            local old="$1" new="$2"
+            [[ "$old" =~ ^[0-9]+$ ]] || old=0
+            [[ "$new" =~ ^[0-9]+$ ]] || new=0
+            if [ "$new" -gt "$old" ]; then printf '%s' "$new"; else printf '%s' "$old"; fi
+          }
+
+          claude="$(choose "$(current CLAUDE_LAST)" "${CLAUDE_NEW:-}")"
+          codex="$(choose "$(current CODEX_LAST)" "${CODEX_NEW:-}")"
+          {
+            echo '# No 5-Hour Limit state - epoch seconds of the last successful ping'
+            echo "CLAUDE_LAST=$claude"
+            echo "CODEX_LAST=$codex"
+          } > state/cloud-state.env
+
+          # No provider CLI runs in this fresh job. Add the repository write
+          # token only for the push, then remove it from Git config on exit.
+          auth_header="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth_header"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true' EXIT
+
+          git add -- state/cloud-state.env
+          if git diff --cached --quiet -- state/cloud-state.env; then
+            echo 'State unchanged - nothing to commit.'
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: record keepalive ping [skip ci]'
+
+          branch="${GITHUB_REF_NAME:-main}"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$branch"; then exit 0; fi
+            echo "Push rejected (attempt $attempt) - rebasing onto origin/$branch."
+            git fetch --unshallow origin "$branch" 2>/dev/null || git fetch origin "$branch"
+            if ! git rebase "origin/$branch"; then
+              conflicts="$(git diff --name-only --diff-filter=U)"
+              if [ "$conflicts" != 'state/cloud-state.env' ]; then
+                git rebase --abort
+                echo '::error::Unexpected rebase conflict'; exit 1
+              fi
+              { git show :2:state/cloud-state.env; git show :3:state/cloud-state.env; } |
+                awk -F= '/^(CLAUDE_LAST|CODEX_LAST)=[0-9]+$/ { if ($2+0 > v[$1]+0) v[$1]=$2+0 }
+                  END { printf "CLAUDE_LAST=%.0f\nCODEX_LAST=%.0f\n", v["CLAUDE_LAST"], v["CODEX_LAST"] }' > state/cloud-state.env
+              git add state/cloud-state.env
+              GIT_EDITOR=true git rebase --continue || { git rebase --abort; exit 1; }
+            fi
+          done
+          echo '::error::Could not push the updated state after 3 attempts.'
+          exit 1

@@ -1,0 +1,8 @@
+[build]
+  publish = "netlify/public"
+  functions = "netlify/functions"
+  # State-only bot commits must not cause a build after every successful ping.
+  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- netlify netlify.toml"
+
+[build.environment]
+  NODE_VERSION = "22"
