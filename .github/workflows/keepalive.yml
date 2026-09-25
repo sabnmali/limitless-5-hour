@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
+      enabled: ${{ steps.due.outputs.enabled }}
       claude_due: ${{ steps.due.outputs.claude_due }}
       codex_due: ${{ steps.due.outputs.codex_due }}
     steps:
@@ -78,6 +79,9 @@ jobs:
           enabled="$(bash bin/keepalive.sh --config "$effective" --enabled)" || {
             echo '::error::Could not read the cloud configuration'; exit 1; }
           echo "Enabled providers: ${enabled:-none}"
+          case " $enabled " in *' claude '*) e_claude=claude ;; *) e_claude= ;; esac
+          case " $enabled " in *' codex '*)  e_codex=codex ;;   *) e_codex= ;; esac
+          echo "enabled=$e_claude $e_codex" >> "$GITHUB_OUTPUT"
 
           set +e
           due="$(L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$effective" --due)"
@@ -102,6 +106,7 @@ jobs:
       contents: read
     outputs:
       last: ${{ steps.ping.outputs.last }}
+      retry: ${{ steps.ping.outputs.retry }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,13 +141,21 @@ jobs:
             exit 1
           fi
           provider_config="$RUNNER_TEMP/claude.env"
-          old="$(awk -F= '$1=="CLAUDE_LAST" && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env)"
-          [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          value() { awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env | tail -n1; }
+          old="$(value CLAUDE_LAST)";  [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          old_retry="$(value CLAUDE_RETRY)"; [[ "$old_retry" =~ ^[0-9]+$ ]] || old_retry=0
           L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config"
-          last="$(awk -F= '$1=="CLAUDE_LAST" && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env)"
-          [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt "$old" ] || {
-            echo '::error::Claude success timestamp did not advance.'; exit 1; }
-          echo "last=$last" >> "$GITHUB_OUTPUT"
+          last="$(value CLAUDE_LAST)";  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+          retry="$(value CLAUDE_RETRY)"; [[ "$retry" =~ ^[0-9]+$ ]] || retry=0
+          if [ "$last" -gt "$old" ]; then
+            echo "last=$last" >> "$GITHUB_OUTPUT"
+          elif [ "$retry" -gt "$old_retry" ]; then
+            # Quota used up: a warning annotation, not a failed run and email.
+            echo "retry=$retry" >> "$GITHUB_OUTPUT"
+            echo "::warning::Claude usage limit reached; next attempt after $(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')."
+          else
+            echo '::error::Claude success timestamp did not advance.'; exit 1
+          fi
           {
             echo '### Claude keepalive'
             echo ''
@@ -160,6 +173,7 @@ jobs:
       contents: read
     outputs:
       last: ${{ steps.ping.outputs.last }}
+      retry: ${{ steps.ping.outputs.retry }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -197,8 +211,9 @@ jobs:
           codex_home="$RUNNER_TEMP/codex-home"
           codex_state="$RUNNER_TEMP/codex-state"
           codex_logs="$RUNNER_TEMP/codex-logs"
-          old="$(awk -F= '$1=="CODEX_LAST" && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env")"
-          [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          value() { awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env" | tail -n1; }
+          old="$(value CODEX_LAST)";  [[ "$old" =~ ^[0-9]+$ ]] || old=0
+          old_retry="$(value CODEX_RETRY)"; [[ "$old_retry" =~ ^[0-9]+$ ]] || old_retry=0
           # Provider code runs inside a disposable container. It can access its
           # own auth file, but never the later secret-update token or any Claude
           # credential. --rm also prevents a package from leaving a host daemon.
@@ -224,10 +239,17 @@ jobs:
             node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 \
             bash -c 'npm install -g @openai/codex@0.155.0 >/dev/null && L5H_STATE_FILE=/repo/state/cloud-state.env bash /repo/bin/keepalive.sh --config /config/cloud.env'
           sudo chown -R "$(id -u):$(id -g)" "$codex_home" "$codex_state" "$codex_logs"
-          last="$(awk -F= '$1=="CODEX_LAST" && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env")"
-          [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt "$old" ] || {
-            echo '::error::Codex success timestamp did not advance.'; exit 1; }
-          echo "last=$last" >> "$GITHUB_OUTPUT"
+          last="$(value CODEX_LAST)";  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+          retry="$(value CODEX_RETRY)"; [[ "$retry" =~ ^[0-9]+$ ]] || retry=0
+          if [ "$last" -gt "$old" ]; then
+            echo "last=$last" >> "$GITHUB_OUTPUT"
+          elif [ "$retry" -gt "$old_retry" ]; then
+            # Quota used up: a warning annotation, not a failed run and email.
+            echo "retry=$retry" >> "$GITHUB_OUTPUT"
+            echo "::warning::Codex usage limit reached; next attempt after $(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')."
+          else
+            echo '::error::Codex success timestamp did not advance.'; exit 1
+          fi
           {
             echo '### Codex keepalive'
             echo ''
@@ -271,7 +293,8 @@ jobs:
     needs: [plan, claude, codex]
     if: >-
       ${{ always() && needs.plan.result == 'success' &&
-          (needs.claude.outputs.last != '' || needs.codex.outputs.last != '') }}
+          (needs.claude.outputs.last != '' || needs.codex.outputs.last != '' ||
+           needs.claude.outputs.retry != '' || needs.codex.outputs.retry != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -285,29 +308,64 @@ jobs:
 
       - name: Save the new state
         env:
+          ENABLED: ${{ needs.plan.outputs.enabled }}
           CLAUDE_NEW: ${{ needs.claude.outputs.last }}
           CODEX_NEW: ${{ needs.codex.outputs.last }}
+          CLAUDE_RETRY_NEW: ${{ needs.claude.outputs.retry }}
+          CODEX_RETRY_NEW: ${{ needs.codex.outputs.retry }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          num() { if [[ "${1:-}" =~ ^[0-9]{1,18}$ ]]; then printf '%s' "$((10#$1))"; else printf 0; fi; }
+          max() { local a b; a="$(num "$1")"; b="$(num "$2")"; if [ "$b" -gt "$a" ]; then printf '%s' "$b"; else printf '%s' "$a"; fi; }
           current() {
-            awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env 2>/dev/null | tail -n1
+            num "$(awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env 2>/dev/null | tail -n1)"
           }
-          choose() {
-            local old="$1" new="$2"
-            [[ "$old" =~ ^[0-9]+$ ]] || old=0
-            [[ "$new" =~ ^[0-9]+$ ]] || new=0
-            if [ "$new" -gt "$old" ]; then printf '%s' "$new"; else printf '%s' "$old"; fi
+          load() {
+            claude_last="$(current CLAUDE_LAST)";   codex_last="$(current CODEX_LAST)"
+            claude_retry="$(current CLAUDE_RETRY)"; codex_retry="$(current CODEX_RETRY)"
           }
 
-          claude="$(choose "$(current CLAUDE_LAST)" "${CLAUDE_NEW:-}")"
-          codex="$(choose "$(current CODEX_LAST)" "${CODEX_NEW:-}")"
-          {
-            echo '# No 5-Hour Limit state - epoch seconds of the last successful ping'
-            echo "CLAUDE_LAST=$claude"
-            echo "CODEX_LAST=$codex"
-          } > state/cloud-state.env
+          # Same floor as keepalive.sh: never below 300 minutes.
+          interval="$(num "$(awk -F= '$1=="INTERVAL_MINUTES" {gsub(/[^0-9]/, "", $2); print $2}' cloud.env 2>/dev/null | tail -n1)")"
+          [ "$interval" -ge 300 ] || interval=300
+
+          # NEXT_DUE lets the Netlify dispatcher skip workflow runs that would
+          # only find nothing due. It is advisory: 0 or a stale value just means
+          # one extra due check, never a missed or extra ping.
+          render() {
+            local next=0 p last retry due
+            for p in ${ENABLED:-}; do
+              case "$p" in
+                claude) last="$claude_last"; retry="$claude_retry" ;;
+                codex)  last="$codex_last";  retry="$codex_retry" ;;
+                *) continue ;;
+              esac
+              due=0
+              [ "$last" -eq 0 ] || due=$((last + interval * 60))
+              [ "$retry" -le "$due" ] || due="$retry"
+              if [ "$next" -eq 0 ] || [ "$due" -lt "$next" ]; then next="$due"; fi
+            done
+            {
+              echo '# No 5-Hour Limit state - epoch seconds of the last successful ping'
+              echo "CLAUDE_LAST=$claude_last"
+              echo "CODEX_LAST=$codex_last"
+              echo "CLAUDE_RETRY=$claude_retry"
+              echo "CODEX_RETRY=$codex_retry"
+              echo "NEXT_DUE=$next"
+            } > state/cloud-state.env
+          }
+          apply_new() {
+            if [ "$(num "${CLAUDE_NEW:-}")" -gt "$claude_last" ]; then claude_last="$(num "$CLAUDE_NEW")"; claude_retry=0; fi
+            if [ "$(num "${CODEX_NEW:-}")" -gt "$codex_last" ];   then codex_last="$(num "$CODEX_NEW")";   codex_retry=0; fi
+            claude_retry="$(max "$claude_retry" "${CLAUDE_RETRY_NEW:-}")"
+            codex_retry="$(max "$codex_retry" "${CODEX_RETRY_NEW:-}")"
+          }
+
+          load
+          apply_new
+          render
 
           # No provider CLI runs in this fresh job. Add the repository write
           # token only for the push, then remove it from Git config on exit.
@@ -335,9 +393,14 @@ jobs:
                 git rebase --abort
                 echo '::error::Unexpected rebase conflict'; exit 1
               fi
+              # Keep each provider's newest ping and retry time from both sides.
               { git show :2:state/cloud-state.env; git show :3:state/cloud-state.env; } |
-                awk -F= '/^(CLAUDE_LAST|CODEX_LAST)=[0-9]+$/ { if ($2+0 > v[$1]+0) v[$1]=$2+0 }
-                  END { printf "CLAUDE_LAST=%.0f\nCODEX_LAST=%.0f\n", v["CLAUDE_LAST"], v["CODEX_LAST"] }' > state/cloud-state.env
+                awk -F= '/^(CLAUDE_LAST|CODEX_LAST|CLAUDE_RETRY|CODEX_RETRY)=[0-9]+$/ { if ($2+0 > v[$1]+0) v[$1]=$2+0 }
+                  END { printf "CLAUDE_LAST=%.0f\nCODEX_LAST=%.0f\nCLAUDE_RETRY=%.0f\nCODEX_RETRY=%.0f\n",
+                        v["CLAUDE_LAST"], v["CODEX_LAST"], v["CLAUDE_RETRY"], v["CODEX_RETRY"] }' > state/cloud-state.env.merged
+              mv state/cloud-state.env.merged state/cloud-state.env
+              load
+              render
               git add state/cloud-state.env
               GIT_EDITOR=true git rebase --continue || { git rebase --abort; exit 1; }
             fi

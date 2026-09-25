@@ -17,6 +17,10 @@
 #   ./bin/keepalive.sh --enabled    list providers the config turns on
 #   ./bin/keepalive.sh --config F   read settings from F instead of config.env
 #
+# A provider that answers "usage limit reached" is not a failure of this job:
+# the retry is deferred (to the reset time the provider names, else one hour)
+# and the run exits 0, so schedulers and CI do not report an error every poll.
+#
 # Env overrides: L5H_CONFIG (config file), L5H_STATE_FILE (state file).
 # ---------------------------------------------------------------------------
 set -uo pipefail
@@ -48,7 +52,7 @@ while [ $# -gt 0 ]; do
         --due)      DO_DUE=1 ;;
         --enabled)  DO_ENABLED=1 ;;
         --config)   [ $# -ge 2 ] || { echo '--config requires a path' >&2; exit 2; }; shift; CONFIG_PATH="$1"; CONFIG_REQUIRED=1 ;;
-        -h|--help)  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,26p'"${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -76,7 +80,7 @@ QUIET_HOURS=
 # careless config cannot reach into the script and reassign PATH, STATE_FILE,
 # DO_FORCE or anything else it was never meant to touch.
 CONFIG_KEYS="INTERVAL_MINUTES CLAUDE_ENABLED CLAUDE_MODEL CLAUDE_PROMPT CLAUDE_BIN CODEX_ENABLED CODEX_MODEL CODEX_PROMPT CODEX_BIN CODEX_REASONING_EFFORT LOG_RETENTION_DAYS QUIET_HOURS"
-STATE_KEYS="CLAUDE_LAST CODEX_LAST"
+STATE_KEYS="CLAUDE_LAST CODEX_LAST CLAUDE_RETRY CODEX_RETRY"
 
 load_kv_file() {
     # Reads KEY=VALUE lines without executing the file. $2 is the allowlist.
@@ -160,9 +164,17 @@ prune_logs() {
 # ---------------------------------------------------------------------------
 CLAUDE_LAST=0
 CODEX_LAST=0
-load_kv_file "$STATE_FILE" "$STATE_KEYS"
-CLAUDE_LAST="$(to_int "$CLAUDE_LAST")" || CLAUDE_LAST=0
-CODEX_LAST="$(to_int "$CODEX_LAST")"   || CODEX_LAST=0
+# Epoch second before which a provider whose quota ran out is not retried.
+CLAUDE_RETRY=0
+CODEX_RETRY=0
+load_state() {
+    load_kv_file "$STATE_FILE" "$STATE_KEYS"
+    CLAUDE_LAST="$(to_int "$CLAUDE_LAST")"   || CLAUDE_LAST=0
+    CODEX_LAST="$(to_int "$CODEX_LAST")"     || CODEX_LAST=0
+    CLAUDE_RETRY="$(to_int "$CLAUDE_RETRY")" || CLAUDE_RETRY=0
+    CODEX_RETRY="$(to_int "$CODEX_RETRY")"   || CODEX_RETRY=0
+}
+load_state
 
 save_state() {
     # Write to a temporary file in the same directory and rename it into place,
@@ -174,6 +186,8 @@ save_state() {
         echo "# No 5-Hour Limit state - epoch seconds of the last successful ping"
         echo "CLAUDE_LAST=$CLAUDE_LAST"
         echo "CODEX_LAST=$CODEX_LAST"
+        echo "CLAUDE_RETRY=$CLAUDE_RETRY"
+        echo "CODEX_RETRY=$CODEX_RETRY"
     } > "$tmp" || { rm -f "$tmp"; log error "could not write state to $STATE_FILE"; return 1; }
     mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; log error "could not replace $STATE_FILE"; return 1; }
     return 0
@@ -240,10 +254,35 @@ in_quiet_hours() {
 # Providers
 # ---------------------------------------------------------------------------
 PING_MESSAGE=''
+# Set by a ping that failed only because the subscription quota is used up:
+# the epoch second after which a retry makes sense.
+PING_RETRY_AT=0
+QUOTA_RETRY_DEFAULT_MINUTES=60
 
-# Cloud runs publish their logs publicly, so raw CLI output must never be
-# echoed verbatim. GitHub masks the secret it injected; this also catches
-# anything else token-shaped, such as a value quoted back in an error.
+# Raw CLI output is only ever matched here, never printed or logged.
+quota_exhausted() {
+    printf '%s' "$1" | grep -qiE 'usage[_ -]?limit|hit your( usage)? limit|limit reached|quota|(^|[^0-9])429([^0-9]|$)|rate[_ -]?limit'
+}
+
+quota_retry_at() {
+    # Codex says "... try again in 2 days 3 hours 5 minutes". Only digits are
+    # taken from that text; anything unreadable falls back to one hour. The
+    # result is clamped to [30 minutes, 7 days] so a parsing surprise can
+    # neither hammer the provider nor park the schedule for weeks.
+    local hint days hours mins total
+    hint="$(printf '%s' "$1" | tr '\n' ' ' | grep -oiE 'try again in[^.]{0,80}' | head -1)"
+    days="$(printf '%s' "$hint"  | grep -oiE '[0-9]+ *days?'            | head -1 | tr -cd '0-9')"
+    hours="$(printf '%s' "$hint" | grep -oiE '[0-9]+ *(hours?|hrs?)'    | head -1 | tr -cd '0-9')"
+    mins="$(printf '%s' "$hint"  | grep -oiE '[0-9]+ *(minutes?|mins?)' | head -1 | tr -cd '0-9')"
+    days="$(to_int "$days")"   || days=0
+    hours="$(to_int "$hours")" || hours=0
+    mins="$(to_int "$mins")"   || mins=0
+    total=$(( days * 1440 + hours * 60 + mins ))
+    [ "$total" -gt 0 ] || total="$QUOTA_RETRY_DEFAULT_MINUTES"
+    [ "$total" -ge 30 ] || total=30
+    [ "$total" -le 10080 ] || total=10080
+    printf '%s' "$(( $(date +%s) + total * 60 ))"
+}
 
 
 # resolve_cli <name> -> echoes an absolute path, or nothing.
@@ -302,7 +341,15 @@ ping_claude() {
     fi
 
     local out rc
+    PING_RETRY_AT=0
     out="$(cd "$WORK_DIR" && run_bounded_cli "$exe" "${args[@]}" 2>&1)"; rc=$?
+
+    if [ "$rc" -ne 124 ] && quota_exhausted "$out" &&
+       { [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -q '"is_error"[[:space:]]*:[[:space:]]*true'; }; then
+        PING_RETRY_AT="$(quota_retry_at "$out")"
+        PING_MESSAGE='claude usage limit reached (CLI output withheld)'
+        return 1
+    fi
 
     # Matching on text alone is not enough: an unrecognised failure would be
     # recorded as a successful ping and stall the schedule for five hours.
@@ -364,6 +411,7 @@ ping_codex() {
     fi
 
     local out rc event_types
+    PING_RETRY_AT=0
     out="$(run_bounded_cli "$exe" "${args[@]}" 2>&1)"; rc=$?
 
     # Event names are a small, non-secret part of JSONL output. They make a
@@ -373,6 +421,13 @@ ping_codex() {
         grep -oE '"type"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' |
         sed -E 's/.*"([A-Za-z0-9._-]+)"/\1/' | sort -u | head -10 |
         tr '\n' ',' | sed 's/,$//' || true)"
+
+    if [ "$rc" -ne 124 ] && quota_exhausted "$out" &&
+       ! printf '%s' "$out" | grep -qE '"type"[[:space:]]*:[[:space:]]*"turn.completed"'; then
+        PING_RETRY_AT="$(quota_retry_at "$out")"
+        PING_MESSAGE="codex usage limit reached (event types=${event_types:-none}; CLI output withheld)"
+        return 1
+    fi
 
     failure_class=provider_error
     failure_detail=none
@@ -418,10 +473,6 @@ ping_codex() {
         return 1
     fi
 
-    if printf '%s' "$out" | grep -qi 'usage limit'; then
-        PING_MESSAGE='usage limit reached - will retry next cycle'
-        return 1
-    fi
     if printf '%s' "$out" | grep -qi 'not logged in'; then
         PING_MESSAGE='not logged in - run: codex login'
         return 1
@@ -461,14 +512,17 @@ show_status() {
     fi
     echo
 
-    local name enabled last ends nextp remain
+    local name enabled last retry ends nextp remain
     for name in claude codex; do
-        if [ "$name" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"
-        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; fi
+        if [ "$name" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"; retry="$CLAUDE_RETRY"
+        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; retry="$CODEX_RETRY"; fi
 
         if ! is_true "$enabled"; then
             printf '  %-6s       : disabled\n' "$name"
             continue
+        fi
+        if [ "$retry" -gt "$now" ]; then
+            printf '  %-6s       : usage limit reached - next attempt %s\n' "$name" "$(fmt_time "$retry")"
         fi
         if [ "$last" -eq 0 ]; then
             printf '  %-6s       : enabled - no successful ping yet\n' "$name"
@@ -539,12 +593,13 @@ if [ "$DO_DUE" -eq 1 ]; then
     DUE_LIST=""
     NOW="$(date +%s)"
     for provider in claude codex; do
-        if [ "$provider" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"
-        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; fi
+        if [ "$provider" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"; retry="$CLAUDE_RETRY"
+        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; retry="$CODEX_RETRY"; fi
         is_true "$enabled" || continue
         if [ "$last" -gt 0 ] && [ $(( (NOW - last) / 60 )) -lt "$INTERVAL_MINUTES" ]; then
             continue
         fi
+        [ "$NOW" -ge "$retry" ] || continue
         DUE_LIST="$DUE_LIST $provider"
     done
     if in_quiet_hours; then
@@ -574,15 +629,13 @@ acquire_lock || {
 }
 
 # Reload after taking the lock: another run may have finished while we waited.
-load_kv_file "$STATE_FILE" "$STATE_KEYS"
-CLAUDE_LAST="$(to_int "$CLAUDE_LAST")" || CLAUDE_LAST=0
-CODEX_LAST="$(to_int "$CODEX_LAST")" || CODEX_LAST=0
+load_state
 
 ANY_FAIL=0
 
 for provider in claude codex; do
-    if [ "$provider" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"
-    else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; fi
+    if [ "$provider" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"; retry="$CLAUDE_RETRY"
+    else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; retry="$CODEX_RETRY"; fi
 
     is_true "$enabled" || continue
 
@@ -593,6 +646,7 @@ for provider in claude codex; do
     if [ "$DO_FORCE" -eq 0 ] && [ "$last" -gt 0 ]; then
         [ $(( (NOW - last) / 60 )) -lt "$INTERVAL_MINUTES" ] && continue
     fi
+    [ "$DO_FORCE" -eq 1 ] || [ "$NOW" -ge "$retry" ] || continue
 
     if [ "$provider" = claude ]; then ping_claude; rc=$?; else ping_codex; rc=$?; fi
 
@@ -602,10 +656,19 @@ for provider in claude codex; do
             # Start the interval at the successful response. A slow CLI call
             # must not shorten the next five-hour window.
             success_now="$(date +%s)"
-            if [ "$provider" = claude ]; then CLAUDE_LAST="$success_now"; else CODEX_LAST="$success_now"; fi
+            if [ "$provider" = claude ]; then CLAUDE_LAST="$success_now"; CLAUDE_RETRY=0
+            else CODEX_LAST="$success_now"; CODEX_RETRY=0; fi
             # Save straight away. Batching the write to the end means a hang or
             # a job timeout on the second provider throws away the first one's
             # success, and the next run pings it again for nothing.
+            save_state || ANY_FAIL=1
+        fi
+    elif [ "$PING_RETRY_AT" -gt 0 ]; then
+        # Quota exhaustion is the provider working as designed, not a broken
+        # job. Record when to try again and keep the exit status clean.
+        log warn "$provider: $PING_MESSAGE - next attempt $(fmt_time "$PING_RETRY_AT")"
+        if [ "$DO_DRYRUN" -eq 0 ]; then
+            if [ "$provider" = claude ]; then CLAUDE_RETRY="$PING_RETRY_AT"; else CODEX_RETRY="$PING_RETRY_AT"; fi
             save_state || ANY_FAIL=1
         fi
     else

@@ -79,7 +79,7 @@ input because its restricted Netlify token can dispatch it.
 | "When does my window reset?" / "Kotam ne zaman yenilenir?" | Run `--status` / `-Status` and report the estimated window end and next ping, explicitly labeling them estimates. Use the provider Usage page for actual reset times. |
 | "Is it running?" | `--status` shows the scheduler row: installed / NOT INSTALLED. |
 | "Start a window now" | Run with `--force` / `-Force`. It sends a message immediately; it does not reset a window that is already open, so it only helps once the previous one has expired. |
-| "It isn't working" | Read the newest file in `<REPO>/logs/`. The most common cause is `not logged in` - the fix is `claude auth login` (or `codex login`). |
+| "It isn't working" | Read the newest file in `<REPO>/logs/`. The most common cause is `not logged in` - the fix is `claude auth login` (or `codex login`). A `usage limit reached - next attempt …` warning is not a fault: the quota is used up and the ping waits until that time. |
 | "Turn it off" (local) | Run the uninstall script. It only removes the scheduler entry; config and logs stay. |
 | "Turn it off" (cloud) | `gh workflow disable keepalive.yml`. The local uninstaller does not stop GitHub Actions. To revoke the credential too, follow SECURITY.md. |
 | "Also keep Codex alive" | Set `CODEX_ENABLED=true` in `<REPO>/config.env` locally. For cloud, follow NETLIFY.md and enable `L5H_CODEX_ENABLED` only in the private deployment after its dedicated credentials exist. |

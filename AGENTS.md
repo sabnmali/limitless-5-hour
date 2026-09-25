@@ -166,5 +166,9 @@ It only opens a new window if the previous one has already expired.
   automation. Never commit auth.json or add it to an artifact/cache.
 - **Do not set `INTERVAL_MINUTES` below 300.** Pinging inside a live window
   consumes quota without opening a new window.
+- **A used-up quota is a deferral, not a failure.** Both scripts record
+  `*_RETRY` / `retryAfterUtc` and exit 0; the workflow turns it into a warning
+  annotation. Do not "fix" this back into a failing job - that is what caused
+  a failure email every half hour.
 - **`.sh` files must keep LF endings.** `.gitattributes` enforces this; do not
   override it.

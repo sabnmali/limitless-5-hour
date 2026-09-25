@@ -22,6 +22,7 @@ response proves a message was processed, not that a new window opened.
 | Claude / Claude Code / Cowork | Claude Code usage contributes to the shared allowance on applicable subscription plans. Additional model, feature, weekly and monthly limits still apply. |
 | Codex | Sends a message through the official Codex CLI using ChatGPT login. |
 | Normal ChatGPT conversations | **Not supported.** Chat usage rules are separate from Work/Codex. A Codex ping does not start all ChatGPT model counters. |
+| Google Antigravity | **Not supported yet.** The Antigravity CLI (`agy -p`) has a headless mode, but its login lives in the OS keyring, so there is no cloud route, and Google does not document whether CLI use starts the IDE's quota window. |
 | Other AI tools or models | No generic support. An official integration and that provider's actual metering rules must be checked first. |
 
 Provider references (reviewed September 2026):
@@ -190,6 +191,13 @@ and quiet hours; it does not reset a live window. Bash `--due` exits 0 if due,
 3 if nothing is due, and 2 for invalid CLI arguments/config paths. `--enabled`
 prints the enabled providers. Normal execution exits 1 on provider/state failure.
 
+When a provider answers that its usage limit is reached, that is not treated
+as a failure: the run exits 0, logs a warning and records a retry time — the
+reset the provider names (Codex says "try again in …"), otherwise one hour,
+clamped to 30 minutes–7 days. `--status` shows it and `--force` ignores it. In
+the cloud this appears as a workflow warning annotation instead of a failed run,
+so GitHub does not email you every half hour while a quota is used up.
+
 ## Troubleshooting and removal
 
 If the laptop shows console flashes or sleep disruption, stop local automation:
@@ -207,6 +215,7 @@ saved timestamps to verify an actual message. CLI errors intentionally withhold
 raw output to keep credentials out of Actions logs. Check `claude auth status` /
 `codex login status` locally, installed CLI versions, and model availability.
 A failed ping is retried at the next scheduler check; no tight retry loop is used.
+A used-up quota is deferred rather than retried (see above).
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install\uninstall-windows.ps1

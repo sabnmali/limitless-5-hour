@@ -20,7 +20,7 @@ to use auth.json automation in public or open-source repositories.
 | `CLAUDE_CODE_OAUTH_TOKEN` | Private deployment repository secret | only the isolated Claude job at run time; nobody can read it back through GitHub |
 | `CODEX_AUTH_JSON` | Private deployment repository secret | only the isolated Codex job |
 | `CODEX_SECRET_UPDATE_TOKEN` | Private deployment repository secret | only the post-container persistence step; repository-scoped Secrets: write, so it can replace any repo-level Actions secret but cannot read values |
-| `L5H_GITHUB_DISPATCH_TOKEN` | Netlify production Functions environment | dispatcher; repository-scoped Actions: write only |
+| `L5H_GITHUB_DISPATCH_TOKEN` | Netlify production Functions environment | dispatcher; repository-scoped Actions: write, optionally Contents: read-only |
 | Local CLI login | Whatever the CLI itself uses (`claude auth login`) | your machine only |
 
 The setup scripts hold the token in memory and pipe it straight into
@@ -127,6 +127,8 @@ surface to apply to here.
 The optional Netlify deployment has a static information page and a private
 scheduled function. It validates the repository, uses a fixed GitHub origin,
 refuses redirects, bounds the request time and withholds upstream error bodies.
+Its optional state read only extracts one numeric `NEXT_DUE` value and fails
+open (dispatches) on any error, so it can skip a check but never add a ping.
 Its public page does not expose health, tokens or provider usage.
 
 ## Reporting a problem

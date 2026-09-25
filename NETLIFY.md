@@ -10,6 +10,12 @@ or the providers' quota rules. No component guarantees an always-open window.
    Only the published production deployment runs scheduled functions.
 2. Create a fine-grained GitHub token restricted to this repository with
    **Actions: read and write**. Do not use your account-wide CLI token.
+   Optionally also grant **Contents: read-only** on the same repository. The
+   dispatcher then reads `NEXT_DUE` from `state/cloud-state.env` and skips the
+   workflow run while nothing is due, which cuts Actions usage from 48 runs a
+   day to a handful. Without it (or if the read fails) every check dispatches.
+   `NEXT_DUE` is refreshed after each ping; after switching a provider on, it
+   can take until that time (at most about five hours) or a manual run.
 3. In Netlify, store it as **L5H_GITHUB_DISPATCH_TOKEN**, restricted to Functions
    and production. Set **L5H_GITHUB_REPOSITORY** to your `owner/repo` and
    **L5H_GITHUB_BRANCH** to the default branch. Redeploy after changing variables.

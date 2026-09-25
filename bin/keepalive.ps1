@@ -199,6 +199,8 @@ function Get-LastPingUtc($State, [string] $Provider) {
     } elseif ($entry.PSObject.Properties.Name -contains 'lastSuccessUtc') {
         $value = $entry.lastSuccessUtc
     }
+    # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates.
+    if ($value -is [datetime]) { return $value.ToUniversalTime() }
     if ([string]::IsNullOrWhiteSpace($value)) { return $null }
 
     try {
@@ -206,6 +208,61 @@ function Get-LastPingUtc($State, [string] $Provider) {
             $value, [System.Globalization.CultureInfo]::InvariantCulture,
             [System.Globalization.DateTimeStyles]::RoundtripKind)
     } catch { return $null }
+}
+
+function Get-RetryUtc($State, [string] $Provider) {
+    # Set when the provider's quota ran out; no ping is attempted before it.
+    if (-not $State.ContainsKey($Provider) -or $null -eq $State[$Provider]) { return $null }
+    $entry = $State[$Provider]
+    $value = $null
+    if ($entry -is [System.Collections.IDictionary]) { $value = $entry['retryAfterUtc'] }
+    elseif ($entry.PSObject.Properties.Name -contains 'retryAfterUtc') { $value = $entry.retryAfterUtc }
+    # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates.
+    if ($value -is [datetime]) { return $value.ToUniversalTime() }
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    try {
+        return [datetime]::Parse(
+            $value, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)
+    } catch { return $null }
+}
+
+function Set-ProviderEntry($State, [string] $Provider, [hashtable] $Values) {
+    # ConvertFrom-Json gives PSCustomObjects; rebuild as a hashtable so the
+    # other field of the entry survives the update.
+    $entry = @{}
+    $old = $State[$Provider]
+    if ($old -is [System.Collections.IDictionary]) { foreach ($k in $old.Keys) { $entry[$k] = $old[$k] } }
+    elseif ($null -ne $old) { foreach ($p in $old.PSObject.Properties) { $entry[$p.Name] = $p.Value } }
+    foreach ($k in $Values.Keys) {
+        if ($null -eq $Values[$k]) { $entry.Remove($k) } else { $entry[$k] = $Values[$k] }
+    }
+    $State[$Provider] = $entry
+}
+
+# Raw CLI output is only ever matched here, never printed or logged.
+function Test-QuotaExhausted([string] $Text) {
+    return ($Text -match '(?i)usage[_ -]?limit|hit your( usage)? limit|limit reached|quota|(^|[^0-9])429([^0-9]|$)|rate[_ -]?limit')
+}
+
+function Get-QuotaRetryUtc([string] $Text) {
+    # Codex says "... try again in 2 days 3 hours 5 minutes". Only digits are
+    # taken from that text; anything unreadable falls back to one hour. Clamped
+    # to [30 minutes, 7 days], matching keepalive.sh.
+    $minutes = 0
+    $hint = [regex]::Match(($Text -replace '\r?\n', ' '), '(?i)try again in[^.]{0,80}').Value
+    if ($hint) {
+        $d = [regex]::Match($hint, '(?i)(\d{1,4}) *days?')
+        $h = [regex]::Match($hint, '(?i)(\d{1,4}) *(hours?|hrs?)')
+        $m = [regex]::Match($hint, '(?i)(\d{1,5}) *(minutes?|mins?)')
+        if ($d.Success) { $minutes += [int] $d.Groups[1].Value * 1440 }
+        if ($h.Success) { $minutes += [int] $h.Groups[1].Value * 60 }
+        if ($m.Success) { $minutes += [int] $m.Groups[1].Value }
+    }
+    if ($minutes -le 0) { $minutes = 60 }
+    if ($minutes -lt 30) { $minutes = 30 }
+    if ($minutes -gt 10080) { $minutes = 10080 }
+    return [datetime]::UtcNow.AddMinutes($minutes)
 }
 
 # --------------------------------------------------------------------------
@@ -285,12 +342,17 @@ function Invoke-ClaudePing {
 
     $invocation = Invoke-BoundedCli $exe $cliArgs $WorkDir
     $raw = $invocation.output
-    if ($invocation.code -ne 0) {
-        return @{ ok = $false; message = "claude exited $($invocation.code) (CLI output withheld; 124 = timeout)" }
-    }
 
     $json = $null
     try { $json = $raw | ConvertFrom-Json -ErrorAction Stop } catch { }
+
+    if ($invocation.code -ne 124 -and (Test-QuotaExhausted $raw) -and
+        ($invocation.code -ne 0 -or ($null -ne $json -and $json.is_error -eq $true))) {
+        return @{ ok = $false; retryAt = (Get-QuotaRetryUtc $raw); message = 'claude usage limit reached (CLI output withheld)' }
+    }
+    if ($invocation.code -ne 0) {
+        return @{ ok = $false; message = "claude exited $($invocation.code) (CLI output withheld; 124 = timeout)" }
+    }
 
     if ($null -eq $json -or $json.type -ne 'result' -or $json.subtype -ne 'success' -or $json.is_error -ne $false) {
         return @{ ok = $false; message = 'claude did not return a successful result (CLI output withheld)' }
@@ -332,6 +394,10 @@ function Invoke-CodexPing {
 
     $invocation = Invoke-BoundedCli $exe $cliArgs $WorkDir
     $raw = $invocation.output
+    if ($invocation.code -ne 124 -and (Test-QuotaExhausted $raw) -and
+        $raw -notmatch '"type"\s*:\s*"turn\.completed"') {
+        return @{ ok = $false; retryAt = (Get-QuotaRetryUtc $raw); message = 'codex usage limit reached (CLI output withheld)' }
+    }
     if ($invocation.code -ne 0) {
         return @{ ok = $false; message = "codex exited $($invocation.code) (CLI output withheld; 124 = timeout)" }
     }
@@ -379,6 +445,11 @@ function Show-Status {
         if (-not $enabled) {
             Write-Host ("  {0}       : disabled" -f $label) -ForegroundColor DarkGray
             continue
+        }
+
+        $retry = Get-RetryUtc $state $name
+        if ($null -ne $retry -and $retry -gt [datetime]::UtcNow) {
+            Write-Host ("  {0}       : usage limit reached - next attempt {1}" -f $label, $retry.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Yellow
         }
 
         $last = Get-LastPingUtc $state $name
@@ -464,6 +535,8 @@ foreach ($name in @('claude', 'codex')) {
         $elapsed = ($nowUtc - $last).TotalMinutes
         if ($elapsed -lt $IntervalMinutes) { continue }
     }
+    $retry = Get-RetryUtc $state $name
+    if ((-not $Force) -and ($null -ne $retry) -and ($nowUtc -lt $retry)) { continue }
 
     if ($name -eq 'claude') { $result = Invoke-ClaudePing } else { $result = Invoke-CodexPing }
 
@@ -473,13 +546,22 @@ foreach ($name in @('claude', 'codex')) {
             # Start the interval at the successful response. A slow CLI call
             # must not shorten the next five-hour window.
             $successUtc = [datetime]::UtcNow
-            $state[$name] = @{
+            Set-ProviderEntry $state $name @{
                 lastSuccessUtc = $successUtc.ToString('o')
                 lastMessage    = $result.message
+                retryAfterUtc  = $null
             }
             # Save straight away. Batching the write to the end means a hang on
             # the second provider throws away the first one's success, and the
             # next run pings it again for nothing.
+            if (-not (Write-State $state)) { $anyFail = $true }
+        }
+    } elseif ($result.ContainsKey('retryAt')) {
+        # Quota exhaustion is the provider working as designed, not a broken
+        # job. Record when to try again and keep the exit status clean.
+        Write-Log 'warn' ("{0}: {1} - next attempt {2}" -f $name, $result.message, $result.retryAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+        if (-not $DryRun) {
+            Set-ProviderEntry $state $name @{ retryAfterUtc = $result.retryAt.ToString('o') }
             if (-not (Write-State $state)) { $anyFail = $true }
         }
     } else {

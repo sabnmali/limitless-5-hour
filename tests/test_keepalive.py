@@ -39,6 +39,8 @@ if ($env:FAKE_MODE -eq 'exit') { $global:LASTEXITCODE = 7; Write-Output 'secret-
 if ($env:FAKE_MODE -eq 'invalid') { Write-Output '{}'; return }
 if ($env:FAKE_MODE -eq 'zero') { Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":0}}'; return }
 if ($env:FAKE_MODE -eq 'codex') { Write-Output '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'; return }
+if ($env:FAKE_MODE -eq 'limit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; return }
+if ($env:FAKE_MODE -eq 'codexlimit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; return }
 Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'
 ''')
         else:
@@ -51,6 +53,8 @@ exit) echo secret-test-123; exit 7 ;;
 invalid) echo '{}' ;;
 zero) echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":0}}' ;;
 codex) echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}' ;;
+limit) echo '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; exit 1 ;;
+codexlimit) echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; exit 1 ;;
 *) echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}' ;;
 esac
 ''', newline='\n')
@@ -127,6 +131,40 @@ esac
         result = self.run_cli()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def retry_after(self, provider):
+        if self.platform == 'ps':
+            saved = json.loads((self.root / 'state/state.json').read_text(encoding='utf-8-sig'))
+            # ToString('o') on a UTC time: 2026-09-25T18:00:00.1234567Z
+            return datetime.fromisoformat(saved[provider]['retryAfterUtc'][:19] + '+00:00').timestamp()
+        values = dict(line.split('=', 1) for line in (self.root / 'state/state.env').read_text().splitlines() if '=' in line)
+        return int(values[f'{provider.upper()}_RETRY'])
+
+    def test_usage_limit_defers_instead_of_failing(self):
+        self.env['FAKE_MODE'] = 'limit'
+        started = time.time()
+        first = self.run_cli()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn('usage limit reached', first.stdout)
+        self.assertAlmostEqual(self.retry_after('claude'), started + 3600, delta=120)
+        second = self.run_cli()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.calls(), 1)
+        self.assertIn('usage limit reached', self.run_cli('--status').stdout)
+        self.env['FAKE_MODE'] = 'ok'
+        self.assertEqual(self.run_cli('--force').returncode, 0)
+        self.assertEqual(self.calls(), 2)
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.calls(), 2)
+
+    def test_codex_reset_hint_sets_retry_time(self):
+        self.config(codex=True)
+        self.env['FAKE_MODE'] = 'codexlimit'
+        started = time.time()
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('Try again', result.stdout + result.stderr)
+        self.assertAlmostEqual(self.retry_after('codex'), started + (2 * 1440 + 180) * 60, delta=120)
+
     def test_dry_run_never_calls_cli(self):
         self.assertEqual(self.run_cli('--dry-run', '--force').returncode, 0)
         self.assertEqual(self.calls(), 0)
@@ -194,6 +232,12 @@ class BashTests(KeepaliveTests, unittest.TestCase):
         self.assertEqual(self.calls(), 0)
         self.assertEqual(self.run_cli().returncode, 0)
         self.assertEqual(self.run_cli('--due').returncode, 3)
+
+    def test_due_respects_quota_deferral(self):
+        self.env['FAKE_MODE'] = 'limit'
+        self.assertEqual(self.run_cli().returncode, 0)
+        due = self.run_cli('--due')
+        self.assertEqual(due.returncode, 3, due.stdout)
 
     def test_missing_config_argument(self):
         self.assertEqual(self.run_cli('--config').returncode, 2)

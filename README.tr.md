@@ -22,6 +22,7 @@ bir cevap yalnızca mesajın işlendiğini kanıtlar; yeni pencere açıldığı
 | Claude / Claude Code / Cowork | Uygun aboneliklerde Claude Code kullanımı ortak kotaya dahildir. Model, özellik, haftalık ve aylık ek limitler devam eder. |
 | Codex | ChatGPT abonelik girişiyle resmî Codex CLI üzerinden mesaj gönderir. |
 | Normal ChatGPT sohbetleri | **Desteklenmiyor.** Sohbet kullanım kuralları Work/Codex'ten ayrıdır. Codex mesajı bütün ChatGPT modellerinin sayaçlarını başlatmaz. |
+| Google Antigravity | **Henüz desteklenmiyor.** Antigravity CLI'ın (`agy -p`) arayüzsüz modu var ama girişi işletim sisteminin anahtar deposunda tutuluyor; bulut yolu yok ve Google, CLI kullanımının IDE'nin kota penceresini başlatıp başlatmadığını belgelemiyor. |
 | Başka AI araçları | Genel bir destek yoktur; resmî entegrasyon ve gerçek kota kuralları ayrıca doğrulanmalıdır. |
 
 Eylül 2026'da kontrol edilen kaynaklar:
@@ -190,6 +191,13 @@ değildir.** Gerçek sayaç için servisin Kullanım sayfasına bak. `--force` a
 ve sessiz saatleri yok sayar; açık pencereyi sıfırlamaz. Bash `--due` gönderim
 zamanı geldiyse 0, iş yoksa 3 döner. `--enabled` açık servisleri listeler.
 Normal çalışmada servis veya durum yazma hatası 1 döndürür.
+
+Servis "kullanım limitine ulaşıldı" derse bu hata sayılmaz: çalışma 0 ile
+biter, uyarı yazar ve bir sonraki deneme zamanını kaydeder. Bu zaman servisin
+söylediği sıfırlanma süresidir (Codex "try again in …" der), yoksa bir saattir;
+30 dakika ile 7 gün arasında tutulur. `--status` bunu gösterir, `--force` yok
+sayar. Bulutta başarısız çalışma yerine uyarı notu olarak görünür; kota bitmişken
+GitHub her yarım saatte hata maili atmaz.
 
 ## Sorun giderme ve kaldırma
 
