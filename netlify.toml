@@ -1,8 +1,9 @@
 [build]
   publish = "netlify/public"
   functions = "netlify/functions"
-  # State-only bot commits must not cause a build after every successful ping.
-  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- netlify netlify.toml"
+  # State-only bot commits carry [skip ci], which Netlify also honours. A
+  # custom ignore command is deliberately absent: a diff against its cached
+  # commit once cancelled a real dispatcher change as "no content change".
 
 [build.environment]
   NODE_VERSION = "22"

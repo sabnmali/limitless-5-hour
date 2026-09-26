@@ -27,7 +27,7 @@ or the providers' quota rules. No component guarantees an always-open window.
    GitHub health check.
 6. Check Netlify function failures and GitHub Actions failures. Renew the token
    before its expiry. Stay within your Netlify plan; there are about 1,440
-   invocations per 30 days. State-only commits are skipped by the build ignore rule.
+   invocations per 30 days. State-only commits carry `[skip ci]`, so Netlify does not build them.
 
 No new npm dependencies or public trigger endpoint are used. GitHub cron can
 remain as fallback because all dispatches use the same lock and state.

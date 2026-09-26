@@ -45,7 +45,7 @@ function fakeGitHub(stateResponse) {
 
 test('skips the workflow run while nothing is due', async () => {
   const gh = fakeGitHub(() => ({ status: 200, text: async () => 'CLAUDE_LAST=1\nNEXT_DUE=2000000\n' }));
-  const result = await run(env, gh.request, 1000000 * 1000);
+  const result = await run(env, gh.request, (2000000 - 3600) * 1000);
   assert.deepEqual(result, { dispatched: false, due: 2000000 });
   assert.deepEqual(gh.calls, [STATE]);
 });
@@ -53,6 +53,10 @@ test('dispatches once the recorded due time has arrived', async () => {
   const gh = fakeGitHub(() => ({ status: 200, text: async () => 'NEXT_DUE=2000000\n' }));
   assert.equal((await run(env, gh.request, 2000000 * 1000)).dispatched, true);
   assert.deepEqual(gh.calls, [STATE, DISPATCH]);
+});
+test('distrusts a due time implausibly far in the future', async () => {
+  const gh = fakeGitHub(() => ({ status: 200, text: async () => `NEXT_DUE=${1000000 + 9 * 86400}\n` }));
+  assert.equal((await run(env, gh.request, 1000000 * 1000)).dispatched, true);
 });
 test('fails open when the state cannot be read', async () => {
   for (const response of [

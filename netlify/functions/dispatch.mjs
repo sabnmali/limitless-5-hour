@@ -66,8 +66,11 @@ export async function dispatch(env, request = fetch) {
 
 export async function run(env, request = fetch, now = Date.now()) {
   const due = await nextDue(env, request);
+  const nowSeconds = now / 1000;
   // A two-minute margin absorbs clock skew between Netlify and the runner.
-  if (due > 0 && now / 1000 < due - 120) {
+  // Nothing legitimate is due more than 8 days out (a 5-hour interval plus
+  // the 7-day retry cap), so a larger value is distrusted and dispatches.
+  if (due > 0 && nowSeconds < due - 120 && due - nowSeconds <= 8 * 86400) {
     return { dispatched: false, due };
   }
   await dispatch(env, request);

@@ -261,7 +261,10 @@ QUOTA_RETRY_DEFAULT_MINUTES=60
 
 # Raw CLI output is only ever matched here, never printed or logged.
 quota_exhausted() {
-    printf '%s' "$1" | grep -qiE 'usage[_ -]?limit|hit your( usage)? limit|limit reached|quota|(^|[^0-9])429([^0-9]|$)|rate[_ -]?limit'
+    # Only the subscription-quota wording. Generic words such as "quota" or
+    # "429" also appear in unrelated faults (disk quota, transient throttling)
+    # and would turn a real, persistent failure into a silent deferral.
+    printf '%s' "$1" | grep -qiE 'usage[_ -]?limit|hit your( usage)? limit'
 }
 
 quota_retry_at() {

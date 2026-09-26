@@ -242,7 +242,9 @@ function Set-ProviderEntry($State, [string] $Provider, [hashtable] $Values) {
 
 # Raw CLI output is only ever matched here, never printed or logged.
 function Test-QuotaExhausted([string] $Text) {
-    return ($Text -match '(?i)usage[_ -]?limit|hit your( usage)? limit|limit reached|quota|(^|[^0-9])429([^0-9]|$)|rate[_ -]?limit')
+    # Only the subscription-quota wording, matching keepalive.sh. Generic words
+    # such as "quota" or "429" also appear in unrelated faults.
+    return ($Text -match '(?i)usage[_ -]?limit|hit your( usage)? limit')
 }
 
 function Get-QuotaRetryUtc([string] $Text) {

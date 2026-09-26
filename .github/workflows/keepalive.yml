@@ -327,9 +327,12 @@ jobs:
             claude_retry="$(current CLAUDE_RETRY)"; codex_retry="$(current CODEX_RETRY)"
           }
 
-          # Same floor as keepalive.sh: never below 300 minutes.
-          interval="$(num "$(awk -F= '$1=="INTERVAL_MINUTES" {gsub(/[^0-9]/, "", $2); print $2}' cloud.env 2>/dev/null | tail -n1)")"
+          # Same rules as keepalive.sh: digits only (else 301), then clamp to
+          # [300, 525600]. A looser parse here could push NEXT_DUE far out.
+          raw="$(awk -F= '$1=="INTERVAL_MINUTES" {print $2}' cloud.env 2>/dev/null | tail -n1 | tr -d " \t\r\"'" || true)"
+          if [[ "$raw" =~ ^[0-9]{1,18}$ ]]; then interval="$((10#$raw))"; else interval=301; fi
           [ "$interval" -ge 300 ] || interval=300
+          [ "$interval" -le 525600 ] || interval=525600
 
           # NEXT_DUE lets the Netlify dispatcher skip workflow runs that would
           # only find nothing due. It is advisory: 0 or a stale value just means
