@@ -205,6 +205,17 @@ if ($Codex) {
         & $gh.Source variable set L5H_CODEX_ENABLED --body true --repo $Repo
         if ($LASTEXITCODE -ne 0) { Die 'Credentials were stored, but Codex could not be enabled. Check repository Actions-variable access.' }
         Ok 'cloud Codex enabled for this repository'
+        # The cloud copy now owns this login. Its first refresh retires the
+        # local token, and using the local copy first would retire the cloud
+        # one, so a leftover file is only a credential lying on disk.
+        $answer = Read-Host ("  Delete the local copy {0} now? (press Enter for yes, or type n)" -f $authFile)
+        if ($answer -match '^(?i:n|no)$') {
+            Write-Host "  !   kept $authFile - do not run codex with this CODEX_HOME, or the cloud login stops working" -ForegroundColor Yellow
+        } else {
+            Remove-Item -LiteralPath $authFile -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $authFile) { Write-Host "  !   could not delete $authFile - remove it yourself" -ForegroundColor Yellow }
+            else { Ok 'local copy deleted' }
+        }
     } else {
         Die "No $authFile found. Run 'codex login' with that dedicated home first."
     }

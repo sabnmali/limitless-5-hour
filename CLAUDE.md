@@ -170,5 +170,8 @@ It only opens a new window if the previous one has already expired.
   `*_RETRY` / `retryAfterUtc` and exit 0; the workflow turns it into a warning
   annotation. Do not "fix" this back into a failing job - that is what caused
   a failure email every half hour.
+- **Other failures back off.** A failed ping records `*_FAILS` / `failures`
+  and waits 30 minutes, doubling to 6 hours, before the next attempt; the
+  cloud job still fails and reports it. `--force` ignores the wait.
 - **`.sh` files must keep LF endings.** `.gitattributes` enforces this; do not
   override it.

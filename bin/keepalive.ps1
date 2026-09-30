@@ -227,6 +227,26 @@ function Get-RetryUtc($State, [string] $Provider) {
     } catch { return $null }
 }
 
+function Get-FailureCount($State, [string] $Provider) {
+    # Consecutive failed attempts; drives the failure backoff.
+    if (-not $State.ContainsKey($Provider) -or $null -eq $State[$Provider]) { return 0 }
+    $entry = $State[$Provider]
+    $value = $null
+    if ($entry -is [System.Collections.IDictionary]) { $value = $entry['failures'] }
+    elseif ($entry.PSObject.Properties.Name -contains 'failures') { $value = $entry.failures }
+    $n = 0
+    if (-not [int]::TryParse([string] $value, [ref] $n) -or $n -lt 0) { return 0 }
+    return [math]::Min($n, 100)
+}
+
+function Get-FailureRetryUtc([int] $Failures) {
+    # 30 min, 1 h, 2 h, 4 h, then 6 h, matching keepalive.sh. A broken login or
+    # CLI is not relaunched every poll; -Force still pings at once.
+    $minutes = 30
+    for ($i = 1; $i -lt $Failures -and $minutes -lt 360; $i++) { $minutes *= 2 }
+    return [datetime]::UtcNow.AddMinutes([math]::Min($minutes, 360))
+}
+
 function Set-ProviderEntry($State, [string] $Provider, [hashtable] $Values) {
     # ConvertFrom-Json gives PSCustomObjects; rebuild as a hashtable so the
     # other field of the entry survives the update.
@@ -280,7 +300,8 @@ function Test-QuietHours {
     if ($sh -gt 23 -or $eh -gt 23 -or $sm -gt 59 -or $em -gt 59) { return $false }
     $start = $sh * 60 + $sm
     $end   = $eh * 60 + $em
-    $nowM  = (Get-Date).Hour * 60 + (Get-Date).Minute
+    $clock = Get-Date   # one read: two could straddle an hour rollover
+    $nowM  = $clock.Hour * 60 + $clock.Minute
     if ($start -le $end) { return ($nowM -ge $start -and $nowM -lt $end) }
     return ($nowM -ge $start -or $nowM -lt $end)   # range crosses midnight
 }
@@ -343,10 +364,17 @@ function Invoke-ClaudePing {
     if ($DryRun) { return @{ ok = $true; message = "DRY RUN: claude $($cliArgs -join ' ')" } }
 
     $invocation = Invoke-BoundedCli $exe $cliArgs $WorkDir
-    $raw = $invocation.output
+    # Match wording on everything, but parse JSON from stdout only: a warning
+    # on stderr must not turn a good ping into a failure.
+    $raw = ($invocation.output, $invocation.errors) -join "`n"
 
     $json = $null
-    try { $json = $raw | ConvertFrom-Json -ErrorAction Stop } catch { }
+    try { $json = $invocation.output | ConvertFrom-Json -ErrorAction Stop } catch {
+        $lastObject = @(([string] $invocation.output) -split '\r?\n' | Where-Object { $_.TrimStart().StartsWith('{') })
+        if ($lastObject.Count -gt 0) {
+            try { $json = $lastObject[-1] | ConvertFrom-Json -ErrorAction Stop } catch { }
+        }
+    }
 
     if ($invocation.code -ne 124 -and (Test-QuotaExhausted $raw) -and
         ($invocation.code -ne 0 -or ($null -ne $json -and $json.is_error -eq $true))) {
@@ -401,7 +429,7 @@ function Invoke-CodexPing {
     if ($DryRun) { return @{ ok = $true; message = "DRY RUN: codex $($cliArgs -join ' ')" } }
 
     $invocation = Invoke-BoundedCli $exe $cliArgs $WorkDir
-    $raw = $invocation.output
+    $raw = ($invocation.output, $invocation.errors) -join "`n"
     if ($invocation.code -ne 124 -and (Test-QuotaExhausted $raw) -and
         $raw -notmatch '"type"\s*:\s*"turn\.completed"') {
         return @{ ok = $false; retryAt = (Get-QuotaRetryUtc $raw); message = 'codex usage limit reached (CLI output withheld)' }
@@ -409,6 +437,9 @@ function Invoke-CodexPing {
     if ($invocation.code -ne 0) {
         return @{ ok = $false; message = "codex exited $($invocation.code) (CLI output withheld; 124 = timeout)" }
     }
+    # Same rules as keepalive.sh.
+    if ($raw -match '(?i)not logged in') { return @{ ok = $false; message = 'not logged in - run: codex login' } }
+    if ($raw -match '(?m)^ERROR:') { return @{ ok = $false; message = 'codex reported an error (CLI output withheld)' } }
 
     $completed = $false
     foreach ($line in ($raw -split '\r?\n')) {
@@ -456,7 +487,10 @@ function Show-Status {
         }
 
         $retry = Get-RetryUtc $state $name
-        if ($null -ne $retry -and $retry -gt [datetime]::UtcNow) {
+        $fails = Get-FailureCount $state $name
+        if ($null -ne $retry -and $retry -gt [datetime]::UtcNow -and $fails -gt 0) {
+            Write-Host ("  {0}       : last {1} attempt(s) failed - next attempt {2} (see log)" -f $label, $fails, $retry.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Yellow
+        } elseif ($null -ne $retry -and $retry -gt [datetime]::UtcNow) {
             Write-Host ("  {0}       : usage limit reached - next attempt {1}" -f $label, $retry.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Yellow
         }
 
@@ -484,7 +518,8 @@ function Show-Status {
 
     Write-Host ''
     # When driven from cloud.env, the local task is not what is running this.
-    if ($ConfigPath -match 'cloud' -or $StateFile -match 'cloud') {
+    # Match the file name only, not a folder that happens to contain "cloud".
+    if ((Split-Path -Leaf $ConfigPath) -eq 'cloud.env') {
         Write-Host '  scheduler    : GitHub Actions (.github/workflows/keepalive.yml)' -ForegroundColor Green
         Write-Host '     check runs  gh run list --workflow keepalive.yml'
         Write-Host ("  log file     : {0}" -f $LogFile)
@@ -546,7 +581,15 @@ foreach ($name in @('claude', 'codex')) {
     $retry = Get-RetryUtc $state $name
     if ((-not $Force) -and ($null -ne $retry) -and ($nowUtc -lt $retry)) { continue }
 
-    if ($name -eq 'claude') { $result = Invoke-ClaudePing } else { $result = Invoke-CodexPing }
+    # An unexpected PowerShell error would otherwise abort only this statement
+    # and leave the run looking successful. Never report its text.
+    $result = $null
+    try {
+        if ($name -eq 'claude') { $result = Invoke-ClaudePing } else { $result = Invoke-CodexPing }
+    } catch { $result = $null }
+    if ($result -isnot [hashtable]) {
+        $result = @{ ok = $false; message = "$name check failed inside PowerShell (details withheld)" }
+    }
 
     if ($result.ok) {
         Write-Log 'info' $result.message
@@ -558,6 +601,7 @@ foreach ($name in @('claude', 'codex')) {
                 lastSuccessUtc = $successUtc.ToString('o')
                 lastMessage    = $result.message
                 retryAfterUtc  = $null
+                failures       = $null
             }
             # Save straight away. Batching the write to the end means a hang on
             # the second provider throws away the first one's success, and the
@@ -569,12 +613,21 @@ foreach ($name in @('claude', 'codex')) {
         # job. Record when to try again and keep the exit status clean.
         Write-Log 'warn' ("{0}: {1} - next attempt {2}" -f $name, $result.message, $result.retryAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))
         if (-not $DryRun) {
-            Set-ProviderEntry $state $name @{ retryAfterUtc = $result.retryAt.ToString('o') }
+            # The provider answered and knows the account: not a failure streak.
+            Set-ProviderEntry $state $name @{ retryAfterUtc = $result.retryAt.ToString('o'); failures = $null }
             if (-not (Write-State $state)) { $anyFail = $true }
         }
     } else {
         $anyFail = $true
-        Write-Log 'error' ("{0}: {1}" -f $name, $result.message)
+        if (-not $DryRun) {
+            $fails = [math]::Min((Get-FailureCount $state $name) + 1, 100)
+            $retryAt = Get-FailureRetryUtc $fails
+            Write-Log 'error' ("{0}: {1} - failure {2} in a row, next attempt {3}" -f $name, $result.message, $fails, $retryAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+            Set-ProviderEntry $state $name @{ retryAfterUtc = $retryAt.ToString('o'); failures = $fails }
+            [void] (Write-State $state)
+        } else {
+            Write-Log 'error' ("{0}: {1}" -f $name, $result.message)
+        }
     }
 }
 

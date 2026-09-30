@@ -215,8 +215,9 @@ sorununun nedeni ayrıca doğrulanmalıdır; bu script ekran ayarlarını deği�
 Yeşil GitHub çalışması yalnızca “henüz zamanı gelmedi” anlamına gelebilir.
 Gerçek mesajı **Ping** adımı ve kayıtlı zamanlarla kontrol et. Güvenlik için ham
 CLI hata çıktıları yayımlanmaz. `claude auth status`, `codex login status`, CLI
-sürümleri ve model erişimini kontrol et. Başarısız gönderim bir sonraki
-zamanlayıcı turunda yeniden denenir.
+sürümleri ve model erişimini kontrol et. Başarısız gönderim 30 dakika, sonra
+1, 2 ve 4 saat, ardından başarılı olana kadar 6 saatte bir yeniden denenir;
+`--force` / `-Force` hemen dener.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install\uninstall-windows.ps1

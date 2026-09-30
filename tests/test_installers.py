@@ -32,8 +32,13 @@ class DistributionSafetyTests(unittest.TestCase):
         self.assertIn('SSL_CERT_FILE=/runner-ca/ca-certificates.crt', workflow)
         self.assertIn('/etc/ssl/certs/ca-certificates.crt:/runner-ca/ca-certificates.crt:ro', workflow)
         self.assertIn('set -euo pipefail', workflow)
-        self.assertIn('Claude success timestamp did not advance.', workflow)
-        self.assertIn('Codex success timestamp did not advance.', workflow)
+        self.assertIn('Claude success timestamp did not advance', workflow)
+        self.assertIn('Codex success timestamp did not advance', workflow)
+        # A queued run must read the saved state, not its event's snapshot.
+        self.assertEqual(workflow.count('ref: ${{ github.ref }}'), workflow.count('uses: actions/checkout@'))
+        # A link or a broken file never replaces the stored Codex login.
+        self.assertIn('[ -L "$auth" ]', workflow)
+        self.assertIn('.auth_mode == "chatgpt"', workflow)
         self.assertIn('\n  claude:\n', workflow)
         self.assertIn('\n  codex:\n', workflow)
         self.assertIn('\n  save:\n', workflow)
@@ -100,7 +105,14 @@ class UnixInstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((repo / 'logs').is_dir())
             line = (base / 'cron.txt').read_text()
+            # cron's own PATH cannot find node for an npm-installed CLI.
+            self.assertIn("PATH='", line)
             command = line.split(' * * * * ', 1)[1].replace('\\%', '%')
             result = subprocess.run([BASH, '-c', command], cwd=base, env=env, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse((base / 'INJECTED').exists())
+
+    def test_every_without_value_is_an_error(self):
+        result = subprocess.run([BASH, str(ROOT / 'install/install-unix.sh'), '--every'], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('--every requires', result.stderr)

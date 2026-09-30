@@ -19,7 +19,8 @@ LABEL="com.no5hourlimit.keepalive"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --every) shift; CHECK_MINUTES="${1:-15}" ;;
+        --every) [ $# -ge 2 ] || { echo '--every requires a number of minutes' >&2; exit 2; }
+                 shift; CHECK_MINUTES="$1" ;;
         -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -118,6 +119,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
     X_KEEPALIVE="$(xml_escape "$KEEPALIVE")"
     X_REPO_ROOT="$(xml_escape "$REPO_ROOT")"
     X_PATH="$(xml_escape "$PATH")"
+    # keepalive.sh keeps its own monthly, pruned log. Its stdout repeats
+    # those lines, so sending it to a launchd file only grows forever.
+    # stderr stays: it only receives crashes.
 
     cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -138,7 +142,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$X_REPO_ROOT/logs/launchd.out.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>$X_REPO_ROOT/logs/launchd.err.log</string>
     <key>EnvironmentVariables</key>
@@ -158,8 +162,14 @@ else
     # Single-quote the shell path before cron's separate percent escaping.
     # Double quotes would execute dollar/backtick substitutions in a folder name.
     case "$KEEPALIVE" in *$'\n'*|*$'\r'*) echo 'Newlines in install paths are unsupported' >&2; exit 2 ;; esac
-    CRON_KEEPALIVE="$(printf '%s' "$KEEPALIVE" | sed "s/'/'\\\\''/g" | sed 's/%/\\%/g')"
-    CRON_LINE="*/$CHECK_MINUTES * * * * /bin/bash '$CRON_KEEPALIVE' >/dev/null 2>&1  # no-5-hour-limit"
+    cron_quote() { printf '%s' "$1" | sed "s/'/'\\\\''/g" | sed 's/%/\\%/g'; }
+    case "$PATH" in *$'\n'*|*$'\r'*) echo 'Newlines in PATH are unsupported' >&2; exit 2 ;; esac
+    CRON_KEEPALIVE="$(cron_quote "$KEEPALIVE")"
+    # cron's PATH is /usr/bin:/bin. An npm-installed CLI starts with
+    # "#!/usr/bin/env node" and fails there (exit 127) unless node's folder
+    # is on PATH, so hand the job the installer's PATH, as launchd gets.
+    CRON_PATH="$(cron_quote "$PATH")"
+    CRON_LINE="*/$CHECK_MINUTES * * * * PATH='$CRON_PATH' /bin/bash '$CRON_KEEPALIVE' >/dev/null 2>&1  # no-5-hour-limit"
     ( crontab -l 2>/dev/null | grep -v 'no-5-hour-limit' || true; echo "$CRON_LINE" ) | crontab -
     ok "crontab entry installed (checks every $CHECK_MINUTES minute(s))"
     step "$CRON_LINE"

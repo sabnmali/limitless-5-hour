@@ -154,6 +154,16 @@ if [ "$WITH_CODEX" -eq 1 ]; then
         gh variable set L5H_CODEX_ENABLED --body true --repo "$REPO" \
             || die "Credentials were stored, but Codex could not be enabled. Check repository Actions-variable access."
         ok "cloud Codex enabled for this repository"
+        # The cloud copy now owns this login. Its first refresh retires the
+        # local token, and using the local copy first would retire the cloud
+        # one, so a leftover file is only a credential lying on disk.
+        printf '  Delete the local copy %s now? [Y/n] ' "$CODEX_HOME/auth.json"
+        answer=''
+        IFS= read -r answer || answer=''
+        case "$answer" in
+            n|N|no|NO) warn "kept $CODEX_HOME/auth.json - do not run codex with this CODEX_HOME, or the cloud login stops working" ;;
+            *) rm -f -- "$CODEX_HOME/auth.json" && ok "local copy deleted" ;;
+        esac
     else
         die "No auth.json found in CODEX_HOME. Run 'codex login' with that dedicated home first."
     fi

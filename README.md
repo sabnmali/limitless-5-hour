@@ -214,7 +214,8 @@ A green GitHub run can mean only “nothing due.” Inspect the **Ping** step an
 saved timestamps to verify an actual message. CLI errors intentionally withhold
 raw output to keep credentials out of Actions logs. Check `claude auth status` /
 `codex login status` locally, installed CLI versions, and model availability.
-A failed ping is retried at the next scheduler check; no tight retry loop is used.
+A failed ping is retried after 30 minutes, then 1, 2 and 4 hours, then every
+6 hours until it succeeds; `--force` / `-Force` retries at once.
 A used-up quota is deferred rather than retried (see above).
 
 ```powershell

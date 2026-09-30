@@ -43,6 +43,10 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The branch tip, not the commit the event recorded: a run that
+          # waited in the concurrency queue must see the state the previous
+          # run saved, or it pings the same provider a second time.
+          ref: ${{ github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -107,10 +111,15 @@ jobs:
     outputs:
       last: ${{ steps.ping.outputs.last }}
       retry: ${{ steps.ping.outputs.retry }}
+      fails: ${{ steps.ping.outputs.fails }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The branch tip, not the commit the event recorded: a run that
+          # waited in the concurrency queue must see the state the previous
+          # run saved, or it pings the same provider a second time.
+          ref: ${{ github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -142,19 +151,42 @@ jobs:
           fi
           provider_config="$RUNNER_TEMP/claude.env"
           value() { awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' state/cloud-state.env | tail -n1; }
+          # Quiet hours may have begun since the plan job: nothing to do.
+          set +e
+          L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config" --due >/dev/null
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;
+            3) echo '::notice::Claude is no longer due; nothing to do.'; exit 0 ;;
+            *) echo "::error::keepalive.sh --due failed with exit $rc"; exit 1 ;;
+          esac
           old="$(value CLAUDE_LAST)";  [[ "$old" =~ ^[0-9]+$ ]] || old=0
           old_retry="$(value CLAUDE_RETRY)"; [[ "$old_retry" =~ ^[0-9]+$ ]] || old_retry=0
+          set +e
           L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config"
+          rc=$?
+          set -e
           last="$(value CLAUDE_LAST)";  [[ "$last" =~ ^[0-9]+$ ]] || last=0
           retry="$(value CLAUDE_RETRY)"; [[ "$retry" =~ ^[0-9]+$ ]] || retry=0
+          fails="$(value CLAUDE_FAILS)"; [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
           if [ "$last" -gt "$old" ]; then
             echo "last=$last" >> "$GITHUB_OUTPUT"
           elif [ "$retry" -gt "$old_retry" ]; then
-            # Quota used up: a warning annotation, not a failed run and email.
             echo "retry=$retry" >> "$GITHUB_OUTPUT"
-            echo "::warning::Claude usage limit reached; next attempt after $(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')."
+            echo "fails=$fails" >> "$GITHUB_OUTPUT"
+            when="$(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')"
+            if [ "$rc" -eq 0 ]; then
+              # Quota used up: a warning annotation, not a failed run and email.
+              echo "::warning::Claude usage limit reached; next attempt after $when."
+            else
+              # The save job stores the backoff; the last step fails the job.
+              echo "::error::Claude ping failed ($fails in a row); next attempt after $when."
+              echo 'failed=true' >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo '::error::Claude success timestamp did not advance.'; exit 1
+            echo "::error::Claude success timestamp did not advance (exit $rc)."
+            echo 'failed=true' >> "$GITHUB_OUTPUT"
           fi
           {
             echo '### Claude keepalive'
@@ -163,6 +195,10 @@ jobs:
             L5H_STATE_FILE=state/cloud-state.env bash bin/keepalive.sh --config "$provider_config" --status
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a failed Claude ping
+        if: steps.ping.outputs.failed == 'true'
+        run: exit 1
 
   codex:
     needs: plan
@@ -174,10 +210,15 @@ jobs:
     outputs:
       last: ${{ steps.ping.outputs.last }}
       retry: ${{ steps.ping.outputs.retry }}
+      fails: ${{ steps.ping.outputs.fails }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The branch tip, not the commit the event recorded: a run that
+          # waited in the concurrency queue must see the state the previous
+          # run saved, or it pings the same provider a second time.
+          ref: ${{ github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -212,6 +253,16 @@ jobs:
           codex_state="$RUNNER_TEMP/codex-state"
           codex_logs="$RUNNER_TEMP/codex-logs"
           value() { awk -F= -v key="$1" '$1==key && $2 ~ /^[0-9]+$/ {print $2}' "$codex_state/cloud-state.env" | tail -n1; }
+          # Quiet hours may have begun since the plan job: nothing to do.
+          set +e
+          L5H_STATE_FILE="$codex_state/cloud-state.env" bash bin/keepalive.sh --config "$provider_config" --due >/dev/null
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;
+            3) echo '::notice::Codex is no longer due; nothing to do.'; exit 0 ;;
+            *) echo "::error::keepalive.sh --due failed with exit $rc"; exit 1 ;;
+          esac
           old="$(value CODEX_LAST)";  [[ "$old" =~ ^[0-9]+$ ]] || old=0
           old_retry="$(value CODEX_RETRY)"; [[ "$old_retry" =~ ^[0-9]+$ ]] || old_retry=0
           # Provider code runs inside a disposable container. It can access its
@@ -219,6 +270,7 @@ jobs:
           # credential. --rm also prevents a package from leaving a host daemon.
           # Host networking avoids response-stream failures behind the nested
           # Docker bridge on GitHub's ephemeral Linux runners.
+          set +e
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --network host \
@@ -238,17 +290,29 @@ jobs:
             -v "/etc/ssl/certs/ca-certificates.crt:/runner-ca/ca-certificates.crt:ro" \
             node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 \
             bash -c 'npm install -g @openai/codex@0.155.0 >/dev/null && L5H_STATE_FILE=/repo/state/cloud-state.env bash /repo/bin/keepalive.sh --config /config/cloud.env'
+          rc=$?
+          set -e
           sudo chown -R "$(id -u):$(id -g)" "$codex_home" "$codex_state" "$codex_logs"
           last="$(value CODEX_LAST)";  [[ "$last" =~ ^[0-9]+$ ]] || last=0
           retry="$(value CODEX_RETRY)"; [[ "$retry" =~ ^[0-9]+$ ]] || retry=0
+          fails="$(value CODEX_FAILS)"; [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
           if [ "$last" -gt "$old" ]; then
             echo "last=$last" >> "$GITHUB_OUTPUT"
           elif [ "$retry" -gt "$old_retry" ]; then
-            # Quota used up: a warning annotation, not a failed run and email.
             echo "retry=$retry" >> "$GITHUB_OUTPUT"
-            echo "::warning::Codex usage limit reached; next attempt after $(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')."
+            echo "fails=$fails" >> "$GITHUB_OUTPUT"
+            when="$(date -u -d "@$retry" '+%Y-%m-%d %H:%M UTC')"
+            if [ "$rc" -eq 0 ]; then
+              # Quota used up: a warning annotation, not a failed run and email.
+              echo "::warning::Codex usage limit reached; next attempt after $when."
+            else
+              # The save job stores the backoff; the last step fails the job.
+              echo "::error::Codex ping failed ($fails in a row); next attempt after $when."
+              echo 'failed=true' >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo '::error::Codex success timestamp did not advance.'; exit 1
+            echo "::error::Codex success timestamp did not advance (exit $rc)."
+            echo 'failed=true' >> "$GITHUB_OUTPUT"
           fi
           {
             echo '### Codex keepalive'
@@ -271,23 +335,40 @@ jobs:
         run: |
           set -euo pipefail
           auth="$RUNNER_TEMP/codex-home/auth.json"
-          if [ ! -s "$auth" ]; then
-            echo '::error::Codex credential file is missing after the run.'
+          # The container could leave a link to another runner file here, or
+          # a truncated file. Neither may replace the stored login.
+          if [ -L "$auth" ] || [ ! -f "$auth" ] || [ ! -s "$auth" ]; then
+            echo '::error::Codex credential file is missing or not a regular file after the run; stored secret left unchanged.'
+            exit 1
+          fi
+          if [ "$(stat -c %s "$auth")" -gt 65536 ] ||
+             ! jq -e '.auth_mode == "chatgpt" and (.tokens.refresh_token | type == "string" and length > 0)' "$auth" >/dev/null 2>&1; then
+            echo '::error::Codex credential file is not a valid ChatGPT login after the run; stored secret left unchanged.'
             exit 1
           fi
           if [ -z "${GH_TOKEN:-}" ]; then
             echo '::error::CODEX_SECRET_UPDATE_TOKEN is missing.'
             exit 1
           fi
-          if ! gh secret set CODEX_AUTH_JSON --repo "$GITHUB_REPOSITORY" < "$auth" >/dev/null 2>&1; then
-            echo '::error::Could not save refreshed Codex credentials.'
-            exit 1
-          fi
-          echo 'Codex credentials saved securely.'
+          # Codex rotates its refresh token. If this save is lost, the stored
+          # secret holds a dead token, so a transient API error gets retries.
+          for attempt in 1 2 3 4; do
+            if gh secret set CODEX_AUTH_JSON --repo "$GITHUB_REPOSITORY" < "$auth" >/dev/null 2>&1; then
+              echo 'Codex credentials saved securely.'
+              exit 0
+            fi
+            [ "$attempt" -eq 4 ] || sleep $((attempt * 10))
+          done
+          echo '::error::Could not save refreshed Codex credentials. If later runs fail to authenticate, upload a fresh login with the setup script (see NETLIFY.md).'
+          exit 1
 
       - name: Remove temporary Codex credentials
         if: always()
         run: sudo rm -rf -- "$RUNNER_TEMP/codex-home"
+
+      - name: Report a failed Codex ping
+        if: steps.ping.outputs.failed == 'true'
+        run: exit 1
 
   save:
     needs: [plan, claude, codex]
@@ -303,6 +384,10 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The branch tip, not the commit the event recorded: a run that
+          # waited in the concurrency queue must see the state the previous
+          # run saved, or it pings the same provider a second time.
+          ref: ${{ github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -313,6 +398,8 @@ jobs:
           CODEX_NEW: ${{ needs.codex.outputs.last }}
           CLAUDE_RETRY_NEW: ${{ needs.claude.outputs.retry }}
           CODEX_RETRY_NEW: ${{ needs.codex.outputs.retry }}
+          CLAUDE_FAILS_NEW: ${{ needs.claude.outputs.fails }}
+          CODEX_FAILS_NEW: ${{ needs.codex.outputs.fails }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -325,6 +412,7 @@ jobs:
           load() {
             claude_last="$(current CLAUDE_LAST)";   codex_last="$(current CODEX_LAST)"
             claude_retry="$(current CLAUDE_RETRY)"; codex_retry="$(current CODEX_RETRY)"
+            claude_fails="$(current CLAUDE_FAILS)"; codex_fails="$(current CODEX_FAILS)"
           }
 
           # Same rules as keepalive.sh: digits only (else 301), then clamp to
@@ -338,7 +426,9 @@ jobs:
           # only find nothing due. It is advisory: 0 or a stale value just means
           # one extra due check, never a missed or extra ping.
           render() {
-            local next=0 p last retry due
+            # have=0 until the first provider is seen, so a provider that is
+            # due right now (0) is not overwritten by a later one.
+            local next=0 have=0 p last retry due
             for p in ${ENABLED:-}; do
               case "$p" in
                 claude) last="$claude_last"; retry="$claude_retry" ;;
@@ -348,7 +438,7 @@ jobs:
               due=0
               [ "$last" -eq 0 ] || due=$((last + interval * 60))
               [ "$retry" -le "$due" ] || due="$retry"
-              if [ "$next" -eq 0 ] || [ "$due" -lt "$next" ]; then next="$due"; fi
+              if [ "$have" -eq 0 ] || [ "$due" -lt "$next" ]; then next="$due"; have=1; fi
             done
             {
               echo '# No 5-Hour Limit state - epoch seconds of the last successful ping'
@@ -356,14 +446,17 @@ jobs:
               echo "CODEX_LAST=$codex_last"
               echo "CLAUDE_RETRY=$claude_retry"
               echo "CODEX_RETRY=$codex_retry"
+              echo "CLAUDE_FAILS=$claude_fails"
+              echo "CODEX_FAILS=$codex_fails"
               echo "NEXT_DUE=$next"
             } > state/cloud-state.env
           }
           apply_new() {
-            if [ "$(num "${CLAUDE_NEW:-}")" -gt "$claude_last" ]; then claude_last="$(num "$CLAUDE_NEW")"; claude_retry=0; fi
-            if [ "$(num "${CODEX_NEW:-}")" -gt "$codex_last" ];   then codex_last="$(num "$CODEX_NEW")";   codex_retry=0; fi
-            claude_retry="$(max "$claude_retry" "${CLAUDE_RETRY_NEW:-}")"
-            codex_retry="$(max "$codex_retry" "${CODEX_RETRY_NEW:-}")"
+            if [ "$(num "${CLAUDE_NEW:-}")" -gt "$claude_last" ]; then claude_last="$(num "$CLAUDE_NEW")"; claude_retry=0; claude_fails=0; fi
+            if [ "$(num "${CODEX_NEW:-}")" -gt "$codex_last" ];   then codex_last="$(num "$CODEX_NEW")";   codex_retry=0; codex_fails=0; fi
+            # A deferral carries its own failure count: 0 for a used-up quota.
+            if [ -n "${CLAUDE_RETRY_NEW:-}" ]; then claude_retry="$(max "$claude_retry" "$CLAUDE_RETRY_NEW")"; claude_fails="$(num "${CLAUDE_FAILS_NEW:-}")"; fi
+            if [ -n "${CODEX_RETRY_NEW:-}" ];  then codex_retry="$(max "$codex_retry" "$CODEX_RETRY_NEW")";   codex_fails="$(num "${CODEX_FAILS_NEW:-}")"; fi
           }
 
           load
@@ -396,11 +489,31 @@ jobs:
                 git rebase --abort
                 echo '::error::Unexpected rebase conflict'; exit 1
               fi
-              # Keep each provider's newest ping and retry time from both sides.
-              { git show :2:state/cloud-state.env; git show :3:state/cloud-state.env; } |
-                awk -F= '/^(CLAUDE_LAST|CODEX_LAST|CLAUDE_RETRY|CODEX_RETRY)=[0-9]+$/ { if ($2+0 > v[$1]+0) v[$1]=$2+0 }
-                  END { printf "CLAUDE_LAST=%.0f\nCODEX_LAST=%.0f\nCLAUDE_RETRY=%.0f\nCODEX_RETRY=%.0f\n",
-                        v["CLAUDE_LAST"], v["CODEX_LAST"], v["CLAUDE_RETRY"], v["CODEX_RETRY"] }' > state/cloud-state.env.merged
+              # Three-way merge per provider: take the side that changed it
+              # from the common base, whole. Merging each field on its own
+              # would pair a new success with an old failure count.
+              { git show :1:state/cloud-state.env 2>/dev/null | sed 's/^/1 /'
+                git show :2:state/cloud-state.env | sed 's/^/2 /'
+                git show :3:state/cloud-state.env | sed 's/^/3 /'; } |
+                awk '
+                  function changed(s, p) {
+                    return v[s, p "_LAST"] != v[1, p "_LAST"] || v[s, p "_RETRY"] != v[1, p "_RETRY"] ||
+                           v[s, p "_FAILS"] != v[1, p "_FAILS"]
+                  }
+                  function pick(p) {
+                    if (!changed(3, p)) return 2
+                    if (!changed(2, p)) return 3
+                    if (v[2, p "_LAST"] != v[3, p "_LAST"]) return (v[2, p "_LAST"] > v[3, p "_LAST"]) ? 2 : 3
+                    return (v[3, p "_RETRY"] > v[2, p "_RETRY"]) ? 3 : 2
+                  }
+                  $2 ~ /^(CLAUDE|CODEX)_(LAST|RETRY|FAILS)=[0-9]+$/ { split($2, kv, "="); v[$1, kv[1]] = kv[2] + 0 }
+                  END {
+                    n = split("CLAUDE CODEX", ps, " ")
+                    for (i = 1; i <= n; i++) {
+                      p = ps[i]; s = pick(p)
+                      printf "%s_LAST=%.0f\n%s_RETRY=%.0f\n%s_FAILS=%.0f\n", p, v[s, p "_LAST"], p, v[s, p "_RETRY"], p, v[s, p "_FAILS"]
+                    }
+                  }' > state/cloud-state.env.merged
               mv state/cloud-state.env.merged state/cloud-state.env
               load
               render

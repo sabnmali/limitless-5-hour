@@ -2,6 +2,8 @@ name: tests
 
 on:
   push:
+    # A pull request runs its own copy; pushing its branch would run it twice.
+    branches: [main]
     paths-ignore:
       - 'state/cloud-state.env'
   pull_request:
@@ -15,7 +17,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS minutes are billed at ten times the Linux rate on private
+        # repositories, so a private deployment tests Linux and Windows only.
+        # The public template still covers all three.
+        os: ${{ fromJSON(github.event.repository.private && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:

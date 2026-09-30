@@ -82,3 +82,70 @@ class CloudStateTests(unittest.TestCase):
             saved = git(base, '--git-dir=remote.git', 'show', 'main:state/cloud-state.env')
             self.assertIn(b'CLAUDE_LAST=100', saved)
             self.assertIn(b'CODEX_LAST=200', saved)
+
+    def run_save(self, initial, **extra):
+        env = self.git_env(**extra)
+        with tempfile.TemporaryDirectory(prefix='keepalive git ') as temp:
+            base = Path(temp)
+
+            def git(cwd, *args):
+                return subprocess.run(['git', *args], cwd=cwd, env=env, capture_output=True, check=True).stdout
+
+            git(base, 'init', '--bare', '--initial-branch=main', 'remote.git')
+            git(base, 'clone', str(base / 'remote.git'), 'runner')
+            runner = base / 'runner'
+            (runner / 'state').mkdir()
+            (runner / 'state/cloud-state.env').write_text(initial, newline='\n')
+            (runner / 'cloud.env').write_text('INTERVAL_MINUTES=301\n', newline='\n')
+            git(runner, 'add', '.')
+            git(runner, 'commit', '-m', 'initial')
+            git(runner, 'push', '-u', 'origin', 'main')
+            result = subprocess.run([BASH, '-c', save_script()], cwd=runner, env=env, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return git(base, '--git-dir=remote.git', 'show', 'main:state/cloud-state.env').decode()
+
+    def test_provider_due_now_keeps_next_due_at_zero(self):
+        # Claude has never pinged, so it is due now: NEXT_DUE must not move
+        # out to Codex's later time, or the dispatcher skips Claude.
+        saved = self.run_save('CLAUDE_LAST=0\nCODEX_LAST=5\n', ENABLED='claude codex', CODEX_NEW='10000')
+        self.assertIn('NEXT_DUE=0\n', saved)
+
+    def test_failure_backoff_is_saved_and_cleared(self):
+        saved = self.run_save('CLAUDE_LAST=100\n', ENABLED='claude', CLAUDE_RETRY_NEW='50000', CLAUDE_FAILS_NEW='2')
+        self.assertIn('CLAUDE_RETRY=50000\n', saved)
+        self.assertIn('CLAUDE_FAILS=2\n', saved)
+        self.assertIn('NEXT_DUE=50000\n', saved)
+        saved = self.run_save('CLAUDE_LAST=100\nCLAUDE_RETRY=50000\nCLAUDE_FAILS=2\n', ENABLED='claude', CLAUDE_NEW='60000')
+        self.assertIn('CLAUDE_RETRY=0\n', saved)
+        self.assertIn('CLAUDE_FAILS=0\n', saved)
+
+    def test_conflict_does_not_revive_a_cleared_failure_count(self):
+        env = self.git_env(ENABLED='claude codex', CLAUDE_NEW='60000')
+        with tempfile.TemporaryDirectory(prefix='keepalive git ') as temp:
+            base = Path(temp)
+
+            def git(cwd, *args):
+                return subprocess.run(['git', *args], cwd=cwd, env=env, capture_output=True, check=True).stdout
+
+            git(base, 'init', '--bare', '--initial-branch=main', 'remote.git')
+            git(base, 'clone', str(base / 'remote.git'), 'runner')
+            runner = base / 'runner'
+            (runner / 'state').mkdir()
+            start = 'CLAUDE_LAST=100\nCODEX_LAST=0\nCLAUDE_RETRY=50000\nCODEX_RETRY=0\nCLAUDE_FAILS=4\nCODEX_FAILS=0\n'
+            (runner / 'state/cloud-state.env').write_text(start, newline='\n')
+            (runner / 'cloud.env').write_text('INTERVAL_MINUTES=301\n', newline='\n')
+            git(runner, 'add', '.')
+            git(runner, 'commit', '-m', 'initial')
+            git(runner, 'push', '-u', 'origin', 'main')
+            git(base, 'clone', str(base / 'remote.git'), 'other')
+            other = base / 'other'
+            (other / 'state/cloud-state.env').write_text(start.replace('CODEX_LAST=0', 'CODEX_LAST=200'), newline='\n')
+            git(other, 'commit', '-am', 'other provider ping')
+            git(other, 'push')
+            result = subprocess.run([BASH, '-c', save_script()], cwd=runner, env=env, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            saved = git(base, '--git-dir=remote.git', 'show', 'main:state/cloud-state.env').decode()
+            self.assertIn('CLAUDE_LAST=60000\n', saved)
+            self.assertIn('CLAUDE_RETRY=0\n', saved)
+            self.assertIn('CLAUDE_FAILS=0\n', saved)
+            self.assertIn('CODEX_LAST=200\n', saved)

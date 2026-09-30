@@ -42,6 +42,7 @@ if ($env:FAKE_MODE -eq 'codex') { Write-Output '{"type":"turn.completed","usage"
 if ($env:FAKE_MODE -eq 'limit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; return }
 if ($env:FAKE_MODE -eq 'weeklylimit') { $global:LASTEXITCODE = 1; Write-Output 'Weekly limit reached - resets Oct 3, 9am'; return }
 if ($env:FAKE_MODE -eq 'diskquota') { $global:LASTEXITCODE = 1; Write-Output 'error: Disk quota exceeded (HTTP 429 from cache)'; return }
+if ($env:FAKE_MODE -eq 'stderrwarn') { Write-Error 'warning: update available'; Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'; return }
 if ($env:FAKE_MODE -eq 'codexlimit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; return }
 Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'
 ''')
@@ -58,6 +59,7 @@ codex) echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":
 limit) echo '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; exit 1 ;;
 weeklylimit) echo 'Weekly limit reached - resets Oct 3, 9am'; exit 1 ;;
 diskquota) echo 'error: Disk quota exceeded (HTTP 429 from cache)'; exit 1 ;;
+stderrwarn) echo 'warning: update available' >&2; echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}' ;;
 codexlimit) echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; exit 1 ;;
 *) echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}' ;;
 esac
@@ -104,8 +106,37 @@ esac
     def test_invalid_output_is_not_success(self):
         self.env['FAKE_MODE'] = 'invalid'
         self.assertEqual(self.run_cli().returncode, 1)
-        self.assertEqual(self.run_cli().returncode, 1)
+        self.assertEqual(self.run_cli('--force').returncode, 1)
         self.assertEqual(self.calls(), 2)
+
+    def test_failure_backs_off_and_force_still_pings(self):
+        self.env['FAKE_MODE'] = 'exit'
+        started = time.time()
+        first = self.run_cli()
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        self.assertIn('next attempt', first.stdout)
+        self.assertAlmostEqual(self.retry_after('claude'), started + 1800, delta=120)
+        # The next poll inside the backoff neither relaunches nor reports.
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.calls(), 1)
+        self.assertIn('failed', self.run_cli('--status').stdout)
+        # A second failure doubles the wait.
+        started = time.time()
+        self.assertEqual(self.run_cli('--force').returncode, 1)
+        self.assertAlmostEqual(self.retry_after('claude'), started + 3600, delta=120)
+        # Success clears the streak.
+        self.env['FAKE_MODE'] = 'ok'
+        self.assertEqual(self.run_cli('--force').returncode, 0)
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.calls(), 3)
+        self.assertNotIn('failed', self.run_cli('--status').stdout)
+
+    def test_stderr_warning_does_not_break_success(self):
+        self.env['FAKE_MODE'] = 'stderrwarn'
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.calls(), 1)
 
     def test_existing_state_is_replaced(self):
         self.assertEqual(self.run_cli().returncode, 0)
@@ -117,7 +148,7 @@ esac
     def test_zero_output_is_not_a_successful_ping(self):
         self.env['FAKE_MODE'] = 'zero'
         self.assertEqual(self.run_cli().returncode, 1)
-        self.assertEqual(self.run_cli().returncode, 1)
+        self.assertEqual(self.run_cli('--force').returncode, 1)
         self.assertEqual(self.calls(), 2)
 
     def test_failed_cli_does_not_leak_output(self):
@@ -215,11 +246,19 @@ esac
         self.assertEqual(self.calls(), 0)
 
     def test_bom_floor_and_allowlist(self):
-        self.config('INTERVAL_MINUTES=1\nPATH=bad\nStateFile=bad\n')
+        hijack = self.root / 'hijack.env'
+        self.config(f'INTERVAL_MINUTES=1\nPATH=bad\nStateFile=bad\nSTATE_FILE={hijack.as_posix()}\nDO_FORCE=1\n')
         self.cfg.write_text('\ufeff' + self.cfg.read_text(), encoding='utf-8')
         result = self.run_cli('--status')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('300 minutes', result.stdout)
+        # Without the allowlist PATH=bad breaks the run, STATE_FILE moves the
+        # state and DO_FORCE pings every time.
+        first = self.run_cli()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.calls(), 1)
+        self.assertFalse(hijack.exists())
 
     def test_concurrent_runs_only_ping_once(self):
         self.env['FAKE_MODE'] = 'slow'
@@ -265,6 +304,37 @@ class BashTests(KeepaliveTests, unittest.TestCase):
 
     def test_missing_config_argument(self):
         self.assertEqual(self.run_cli('--config').returncode, 2)
+
+    def test_help_prints_usage(self):
+        result = self.run_cli('--help')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '')
+        self.assertIn('--status', result.stdout)
+        self.assertNotIn('set -uo', result.stdout)
+
+    @unittest.skipIf(os.name == 'nt', 'Git Bash ps cannot show command lines')
+    def test_old_lock_with_live_reused_pid_is_reclaimed(self):
+        lock = (self.root / 'state/.lock').as_posix()
+        holder = (self.root / 'holder.pid').as_posix()
+        stamp = time.strftime('%Y%m%d%H%M', time.localtime(time.time() - 1800))
+        subprocess.run([BASH, '-c', f'mkdir "{lock}"; sleep 60 >/dev/null 2>&1 & echo $! > "{lock}/pid"; '
+                        f'cp "{lock}/pid" "{holder}"; touch -t {stamp} "{lock}"'], check=True, timeout=10)
+        try:
+            result = self.run_cli()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.calls(), 1)
+        finally:
+            subprocess.run([BASH, '-c', f'kill "$(cat "{holder}")" 2>/dev/null || true'], timeout=10)
+
+    def test_quota_deferral_does_not_mask_a_missing_codex(self):
+        if shutil.which('codex'):
+            self.skipTest('a real codex CLI is on PATH')
+        self.config('CODEX_ENABLED=true\nCODEX_BIN=/nonexistent/codex\n')
+        self.env['HOME'] = self.root.as_posix()
+        self.env['FAKE_MODE'] = 'limit'
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('codex CLI not found', result.stdout)
 
 
 @unittest.skipUnless(PS, 'PowerShell unavailable')

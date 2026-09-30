@@ -20,6 +20,8 @@
 # A provider that answers "usage limit reached" is not a failure of this job:
 # the retry is deferred (to the reset time the provider names, else one hour)
 # and the run exits 0, so schedulers and CI do not report an error every poll.
+# Any other failure exits 1 and backs off (30 min, doubling to 6 hours), so a
+# broken login is not retried - and reported - every poll.
 #
 # Env overrides: L5H_CONFIG (config file), L5H_STATE_FILE (state file).
 # ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ while [ $# -gt 0 ]; do
         --due)      DO_DUE=1 ;;
         --enabled)  DO_ENABLED=1 ;;
         --config)   [ $# -ge 2 ] || { echo '--config requires a path' >&2; exit 2; }; shift; CONFIG_PATH="$1"; CONFIG_REQUIRED=1 ;;
-        -h|--help)  sed -n '2,26p'"${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -80,7 +82,7 @@ QUIET_HOURS=
 # careless config cannot reach into the script and reassign PATH, STATE_FILE,
 # DO_FORCE or anything else it was never meant to touch.
 CONFIG_KEYS="INTERVAL_MINUTES CLAUDE_ENABLED CLAUDE_MODEL CLAUDE_PROMPT CLAUDE_BIN CODEX_ENABLED CODEX_MODEL CODEX_PROMPT CODEX_BIN CODEX_REASONING_EFFORT LOG_RETENTION_DAYS QUIET_HOURS"
-STATE_KEYS="CLAUDE_LAST CODEX_LAST CLAUDE_RETRY CODEX_RETRY"
+STATE_KEYS="CLAUDE_LAST CODEX_LAST CLAUDE_RETRY CODEX_RETRY CLAUDE_FAILS CODEX_FAILS"
 
 load_kv_file() {
     # Reads KEY=VALUE lines without executing the file. $2 is the allowlist.
@@ -164,15 +166,23 @@ prune_logs() {
 # ---------------------------------------------------------------------------
 CLAUDE_LAST=0
 CODEX_LAST=0
-# Epoch second before which a provider whose quota ran out is not retried.
+# Epoch second before which a provider whose quota ran out, or whose last
+# attempt failed, is not retried.
 CLAUDE_RETRY=0
 CODEX_RETRY=0
+# Consecutive failed attempts; drives the failure backoff.
+CLAUDE_FAILS=0
+CODEX_FAILS=0
 load_state() {
     load_kv_file "$STATE_FILE" "$STATE_KEYS"
     CLAUDE_LAST="$(to_int "$CLAUDE_LAST")"   || CLAUDE_LAST=0
     CODEX_LAST="$(to_int "$CODEX_LAST")"     || CODEX_LAST=0
     CLAUDE_RETRY="$(to_int "$CLAUDE_RETRY")" || CLAUDE_RETRY=0
     CODEX_RETRY="$(to_int "$CODEX_RETRY")"   || CODEX_RETRY=0
+    CLAUDE_FAILS="$(to_int "$CLAUDE_FAILS")" || CLAUDE_FAILS=0
+    CODEX_FAILS="$(to_int "$CODEX_FAILS")"   || CODEX_FAILS=0
+    [ "$CLAUDE_FAILS" -le 100 ] || CLAUDE_FAILS=100
+    [ "$CODEX_FAILS" -le 100 ]  || CODEX_FAILS=100
 }
 load_state
 
@@ -188,6 +198,8 @@ save_state() {
         echo "CODEX_LAST=$CODEX_LAST"
         echo "CLAUDE_RETRY=$CLAUDE_RETRY"
         echo "CODEX_RETRY=$CODEX_RETRY"
+        echo "CLAUDE_FAILS=$CLAUDE_FAILS"
+        echo "CODEX_FAILS=$CODEX_FAILS"
     } > "$tmp" || { rm -f "$tmp"; log error "could not write state to $STATE_FILE"; return 1; }
     mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; log error "could not replace $STATE_FILE"; return 1; }
     return 0
@@ -197,16 +209,30 @@ save_state() {
 # On Linux cron that happens on its own as soon as one ping outlives the poll
 # interval. mkdir is the portable atomic primitive; flock is not on macOS.
 LOCK_DIR="$STATE_DIR/.lock"
+lock_owner_is_keepalive() {
+    # When the command line cannot be read, assume it is: keeping a lock is
+    # the safe side, reclaiming a live one can ping twice.
+    local cmd
+    cmd="$(ps -o command= -p "$1" 2>/dev/null)" || return 0
+    [ -n "$cmd" ] || return 0
+    case "$cmd" in *keepalive*) return 0 ;; *) return 1 ;; esac
+}
 acquire_lock() {
     local tries=0
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        # Only reclaim a dead owner. Age alone can evict a still-running CLI.
+        # Reclaim a dead owner at once. After a crash the OS may hand the old
+        # PID to an unrelated process, which would block pings forever, so an
+        # old lock whose live owner is not a keepalive run is reclaimed too.
+        # Age alone is not enough: a run paused by sleep is old but still
+        # mid-ping.
         local owner=''
         [ ! -f "$LOCK_DIR/pid" ] || read -r owner < "$LOCK_DIR/pid"
         if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
             rm -f "$LOCK_DIR/pid"
             rmdir "$LOCK_DIR" 2>/dev/null || true
-        elif [ -z "$owner" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
+        elif [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +20 2>/dev/null)" ] &&
+             { [[ ! "$owner" =~ ^[0-9]+$ ]] || ! lock_owner_is_keepalive "$owner"; }; then
+            rm -f "$LOCK_DIR/pid"
             rmdir "$LOCK_DIR" 2>/dev/null || true
         fi
         tries=$((tries + 1))
@@ -242,7 +268,9 @@ in_quiet_hours() {
     [ "$sh" -le 23 ] && [ "$eh" -le 23 ] && [ "$sm" -le 59 ] && [ "$em" -le 59 ] || return 1
     local start=$((sh * 60 + sm))
     local end=$((eh * 60 + em))
-    local now=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+    # One clock read: two could straddle a minute and hour rollover.
+    local hm; hm="$(date +%H%M)"
+    local now=$((10#${hm:0:2} * 60 + 10#${hm:2:2}))
     if [ "$start" -le "$end" ]; then
         [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ]
     else
@@ -287,6 +315,16 @@ quota_retry_at() {
     printf '%s' "$(( $(date +%s) + total * 60 ))"
 }
 
+failure_retry_at() {
+    # $1 = consecutive failures including this one -> 30 min, 1 h, 2 h, 4 h,
+    # then 6 h. A broken login or CLI is not relaunched (and reported) every
+    # poll; --force still pings at once.
+    local n="$1" minutes=30
+    while [ "$n" -gt 1 ] && [ "$minutes" -lt 360 ]; do minutes=$((minutes * 2)); n=$((n - 1)); done
+    [ "$minutes" -le 360 ] || minutes=360
+    printf '%s' "$(( $(date +%s) + minutes * 60 ))"
+}
+
 
 # resolve_cli <name> -> echoes an absolute path, or nothing.
 # Schedulers (cron, launchd) run with a stripped-down PATH, so an explicit path
@@ -316,6 +354,9 @@ resolve_cli() {
 
 ping_claude() {
     PING_MESSAGE=''
+    # Reset before any early return: a deferral left over from the previous
+    # provider must not turn this provider's failure into a quota wait.
+    PING_RETRY_AT=0
     if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ] ||
        [ "${CLAUDE_CODE_USE_BEDROCK:-0}" = 1 ] || [ "${CLAUDE_CODE_USE_VERTEX:-0}" = 1 ] || [ "${CLAUDE_CODE_USE_FOUNDRY:-0}" = 1 ]; then
         PING_MESSAGE='API/provider credentials detected; use subscription login in a clean environment'
@@ -344,7 +385,6 @@ ping_claude() {
     fi
 
     local out rc
-    PING_RETRY_AT=0
     out="$(cd "$WORK_DIR" && run_bounded_cli "$exe" "${args[@]}" 2>&1)"; rc=$?
 
     if [ "$rc" -ne 124 ] && quota_exhausted "$out" &&
@@ -404,6 +444,7 @@ ping_claude() {
 
 ping_codex() {
     PING_MESSAGE=''
+    PING_RETRY_AT=0
     local exe failure_class failure_detail
     if ! exe="$(resolve_cli codex)"; then
         PING_MESSAGE='codex CLI not found (set CODEX_BIN in config.env, or npm i -g @openai/codex)'
@@ -421,7 +462,6 @@ ping_codex() {
     fi
 
     local out rc event_types
-    PING_RETRY_AT=0
     out="$(run_bounded_cli "$exe" "${args[@]}" 2>&1)"; rc=$?
 
     # Event names are a small, non-secret part of JSONL output. They make a
@@ -492,8 +532,10 @@ ping_codex() {
         return 1
     fi
 
+    # Same rule as keepalive.ps1: only a completed turn that reports usage
+    # proves the model was reached.
     if printf '%s' "$out" | grep -qE '"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"' ||
-       ! printf '%s' "$out" | grep -qE '"type"[[:space:]]*:[[:space:]]*"turn.completed"'; then
+       ! printf '%s' "$out" | grep -E '"type"[[:space:]]*:[[:space:]]*"turn.completed"' | grep -qE '"usage"[[:space:]]*:[[:space:]]*\{'; then
         PING_MESSAGE="codex returned no successful completed turn (class=$failure_class detail=$failure_detail event types=${event_types:-none}; CLI output withheld)"
         return 1
     fi
@@ -522,16 +564,18 @@ show_status() {
     fi
     echo
 
-    local name enabled last retry ends nextp remain
+    local name enabled last retry fails ends nextp remain
     for name in claude codex; do
-        if [ "$name" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"; retry="$CLAUDE_RETRY"
-        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; retry="$CODEX_RETRY"; fi
+        if [ "$name" = claude ]; then enabled="$CLAUDE_ENABLED"; last="$CLAUDE_LAST"; retry="$CLAUDE_RETRY"; fails="$CLAUDE_FAILS"
+        else enabled="$CODEX_ENABLED"; last="$CODEX_LAST"; retry="$CODEX_RETRY"; fails="$CODEX_FAILS"; fi
 
         if ! is_true "$enabled"; then
             printf '  %-6s       : disabled\n' "$name"
             continue
         fi
-        if [ "$retry" -gt "$now" ]; then
+        if [ "$retry" -gt "$now" ] && [ "$fails" -gt 0 ]; then
+            printf '  %-6s       : last %s attempt(s) failed - next attempt %s (see log)\n' "$name" "$fails" "$(fmt_time "$retry")"
+        elif [ "$retry" -gt "$now" ]; then
             printf '  %-6s       : usage limit reached - next attempt %s\n' "$name" "$(fmt_time "$retry")"
         fi
         if [ "$last" -eq 0 ]; then
@@ -556,8 +600,10 @@ show_status() {
     echo
     # When driven from cloud.env / the cloud state file, the local cron entry is
     # not the thing running this - saying "NOT INSTALLED" there is just wrong.
-    case "$CONFIG_PATH$STATE_FILE" in
-        *cloud*)
+    # Match the file names only: a checkout folder named e.g. "cloud-tools"
+    # must not make a local install claim to be GitHub Actions.
+    case "$(basename -- "$CONFIG_PATH") $(basename -- "$STATE_FILE")" in
+        'cloud.env '*|*' cloud-state.env')
             echo "  scheduler    : GitHub Actions (.github/workflows/keepalive.yml)"
             echo "     check runs  gh run list --workflow keepalive.yml"
             ;;
@@ -666,8 +712,8 @@ for provider in claude codex; do
             # Start the interval at the successful response. A slow CLI call
             # must not shorten the next five-hour window.
             success_now="$(date +%s)"
-            if [ "$provider" = claude ]; then CLAUDE_LAST="$success_now"; CLAUDE_RETRY=0
-            else CODEX_LAST="$success_now"; CODEX_RETRY=0; fi
+            if [ "$provider" = claude ]; then CLAUDE_LAST="$success_now"; CLAUDE_RETRY=0; CLAUDE_FAILS=0
+            else CODEX_LAST="$success_now"; CODEX_RETRY=0; CODEX_FAILS=0; fi
             # Save straight away. Batching the write to the end means a hang or
             # a job timeout on the second provider throws away the first one's
             # success, and the next run pings it again for nothing.
@@ -678,12 +724,24 @@ for provider in claude codex; do
         # job. Record when to try again and keep the exit status clean.
         log warn "$provider: $PING_MESSAGE - next attempt $(fmt_time "$PING_RETRY_AT")"
         if [ "$DO_DRYRUN" -eq 0 ]; then
-            if [ "$provider" = claude ]; then CLAUDE_RETRY="$PING_RETRY_AT"; else CODEX_RETRY="$PING_RETRY_AT"; fi
+            # The provider answered and knows the account: not a failure streak.
+            if [ "$provider" = claude ]; then CLAUDE_RETRY="$PING_RETRY_AT"; CLAUDE_FAILS=0
+            else CODEX_RETRY="$PING_RETRY_AT"; CODEX_FAILS=0; fi
             save_state || ANY_FAIL=1
         fi
     else
         ANY_FAIL=1
-        log error "$provider: $PING_MESSAGE"
+        if [ "$DO_DRYRUN" -eq 0 ]; then
+            if [ "$provider" = claude ]; then fails=$((CLAUDE_FAILS + 1)); else fails=$((CODEX_FAILS + 1)); fi
+            [ "$fails" -le 100 ] || fails=100
+            retry_at="$(failure_retry_at "$fails")"
+            log error "$provider: $PING_MESSAGE - failure $fails in a row, next attempt $(fmt_time "$retry_at")"
+            if [ "$provider" = claude ]; then CLAUDE_FAILS="$fails"; CLAUDE_RETRY="$retry_at"
+            else CODEX_FAILS="$fails"; CODEX_RETRY="$retry_at"; fi
+            save_state || true
+        else
+            log error "$provider: $PING_MESSAGE"
+        fi
     fi
 done
 

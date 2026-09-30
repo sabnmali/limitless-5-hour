@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     One-shot helper: get the Claude CLI into a place a scheduled task can
-    actually reach, log it in, and re-run the installer.
+    actually reach, log it in, and pin its path into config.env.
 
 .DESCRIPTION
     Run this in a NORMAL PowerShell window (Start menu -> "PowerShell"), not
@@ -13,7 +13,7 @@
     user folder, which is the most reliable place for a scheduler to find it.
 
 .PARAMETER SkipInstall
-    Don't install the native build; only log in and re-run the installer.
+    Don't install the native build; only log in and pin the path.
 
 .PARAMETER SkipLogin
     Don't run the login step.
@@ -102,14 +102,25 @@ if (-not $SkipLogin -and $exe) {
 }
 
 # --------------------------------------------------------------------------
-# 3. Re-run the installer so the new path gets pinned
+# 3. Pin the path the scheduler can reach
 # --------------------------------------------------------------------------
-Write-Head 'Step 3 / 3 - CLI ready; local automation remains unchanged'
+# Only CLAUDE_BIN in an existing config.env changes. The scheduled task is
+# never registered or re-enabled here; that needs install-windows.ps1
+# -EnableLocal, run deliberately.
+Write-Head 'Step 3 / 3 - pinning the CLI path; local automation remains unchanged'
 
-if ($native) {
-    # Put the native build ahead of the npm shim for this process, so the
-    # installer pins the path the scheduler can actually reach.
-    $env:PATH = (Split-Path -Parent $native) + ';' + $env:PATH
+$configFile = Join-Path $RepoRoot 'config.env'
+if ($exe -and (Test-Path -LiteralPath $configFile)) {
+    $lines = @(Get-Content -LiteralPath $configFile)
+    $found = $false
+    $out = foreach ($l in $lines) {
+        if ($l -match '^\s*CLAUDE_BIN\s*=') { $found = $true; "CLAUDE_BIN=$exe" } else { $l }
+    }
+    if (-not $found) { $out = @($out) + "CLAUDE_BIN=$exe" }
+    Set-Content -LiteralPath $configFile -Value $out -Encoding UTF8
+    Write-Ok "config.env now uses $exe"
+} elseif ($exe) {
+    Write-Ok "no config.env yet - install-windows.ps1 -EnableLocal will pin $exe"
 }
 
 Write-Host 'Local scheduling is separate and requires install\install-windows.ps1 -EnableLocal.'
