@@ -244,7 +244,7 @@ function Set-ProviderEntry($State, [string] $Provider, [hashtable] $Values) {
 function Test-QuotaExhausted([string] $Text) {
     # Only the subscription-quota wording, matching keepalive.sh. Generic words
     # such as "quota" or "429" also appear in unrelated faults.
-    return ($Text -match '(?i)usage[_ -]?limit|hit your( usage)? limit')
+    return ($Text -match '(?i)usage[_ -]?limit|hit your[^.]{0,30}limit|(weekly|5-hour|five-hour|session|opus|sonnet) limit|limit reached')
 }
 
 function Get-QuotaRetryUtc([string] $Text) {
@@ -353,7 +353,13 @@ function Invoke-ClaudePing {
         return @{ ok = $false; retryAt = (Get-QuotaRetryUtc $raw); message = 'claude usage limit reached (CLI output withheld)' }
     }
     if ($invocation.code -ne 0) {
-        return @{ ok = $false; message = "claude exited $($invocation.code) (CLI output withheld; 124 = timeout)" }
+        # A fixed category only, never the CLI's own text.
+        $klass = 'provider_error'
+        if     ($raw -match '(?i)(^|[^0-9])401([^0-9]|$)|unauthori[sz]ed|not logged in|authentication|expired') { $klass = 'authentication' }
+        elseif ($raw -match '(?i)overloaded|(^|[^0-9])(500|502|503|529)([^0-9]|$)|internal server')            { $klass = 'provider_outage' }
+        elseif ($raw -match '(?i)network|connection|econn|dns|certificate|tls|timed out')                       { $klass = 'network' }
+        elseif ($raw -match '(?i)limit')                                                                        { $klass = 'unrecognised_limit' }
+        return @{ ok = $false; message = "claude exited $($invocation.code) (class=$klass; CLI output withheld; 124 = timeout)" }
     }
 
     if ($null -eq $json -or $json.type -ne 'result' -or $json.subtype -ne 'success' -or $json.is_error -ne $false) {

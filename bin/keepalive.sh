@@ -264,7 +264,7 @@ quota_exhausted() {
     # Only the subscription-quota wording. Generic words such as "quota" or
     # "429" also appear in unrelated faults (disk quota, transient throttling)
     # and would turn a real, persistent failure into a silent deferral.
-    printf '%s' "$1" | grep -qiE 'usage[_ -]?limit|hit your( usage)? limit'
+    printf '%s' "$1" | grep -qiE 'usage[_ -]?limit|hit your[^.]{0,30}limit|(weekly|5-hour|five-hour|session|opus|sonnet) limit|limit reached'
 }
 
 quota_retry_at() {
@@ -360,7 +360,14 @@ ping_claude() {
         if [ "$rc" -eq 124 ]; then
             PING_MESSAGE='claude timed out after 120 seconds (CLI output withheld)'
         else
-            PING_MESSAGE="claude exited $rc (CLI output withheld)"
+            # A fixed category only, never the CLI's own text.
+            local klass=provider_error
+            if   printf '%s' "$out" | grep -qiE '(^|[^0-9])401([^0-9]|$)|unauthori[sz]ed|not logged in|authentication|expired'; then klass=authentication
+            elif printf '%s' "$out" | grep -qiE 'overloaded|(^|[^0-9])(500|502|503|529)([^0-9]|$)|internal server'; then klass=provider_outage
+            elif printf '%s' "$out" | grep -qiE 'network|connection|econn|dns|certificate|tls|timed out'; then klass=network
+            elif printf '%s' "$out" | grep -qiE 'limit'; then klass=unrecognised_limit
+            fi
+            PING_MESSAGE="claude exited $rc (class=$klass; CLI output withheld)"
         fi
         return 1
     fi

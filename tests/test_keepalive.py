@@ -40,6 +40,7 @@ if ($env:FAKE_MODE -eq 'invalid') { Write-Output '{}'; return }
 if ($env:FAKE_MODE -eq 'zero') { Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":0}}'; return }
 if ($env:FAKE_MODE -eq 'codex') { Write-Output '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'; return }
 if ($env:FAKE_MODE -eq 'limit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; return }
+if ($env:FAKE_MODE -eq 'weeklylimit') { $global:LASTEXITCODE = 1; Write-Output 'Weekly limit reached - resets Oct 3, 9am'; return }
 if ($env:FAKE_MODE -eq 'diskquota') { $global:LASTEXITCODE = 1; Write-Output 'error: Disk quota exceeded (HTTP 429 from cache)'; return }
 if ($env:FAKE_MODE -eq 'codexlimit') { $global:LASTEXITCODE = 1; Write-Output '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; return }
 Write-Output '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'
@@ -55,6 +56,7 @@ invalid) echo '{}' ;;
 zero) echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":0}}' ;;
 codex) echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}' ;;
 limit) echo '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'; exit 1 ;;
+weeklylimit) echo 'Weekly limit reached - resets Oct 3, 9am'; exit 1 ;;
 diskquota) echo 'error: Disk quota exceeded (HTTP 429 from cache)'; exit 1 ;;
 codexlimit) echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 2 days 3 hours 0 minutes."}}'; exit 1 ;;
 *) echo '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}' ;;
@@ -157,6 +159,18 @@ esac
         self.assertEqual(self.calls(), 2)
         self.assertEqual(self.run_cli().returncode, 0)
         self.assertEqual(self.calls(), 2)
+
+    def test_weekly_or_session_limit_wording_defers(self):
+        self.env['FAKE_MODE'] = 'weeklylimit'
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('usage limit reached', result.stdout)
+
+    def test_unknown_failure_reports_only_a_fixed_class(self):
+        self.env['FAKE_MODE'] = 'exit'
+        result = self.run_cli()
+        self.assertIn('class=provider_error', result.stdout + result.stderr)
+        self.assertNotIn('secret-test-123', result.stdout + result.stderr)
 
     def test_unrelated_quota_error_is_a_real_failure(self):
         for codex in (False, True):
